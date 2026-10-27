@@ -11,6 +11,8 @@ import ipaddress
 import re
 from typing import Mapping, Sequence
 
+from .fdb import FDBEntry, FDB_WALK_ROOTS, parse_fdb
+
 # Numeric OIDs intentionally avoid dependency on vendor MIB files.
 LLDP_REMOTE = '1.0.8802.1.1.2.1.4.1.1'
 LLDP_LOCAL_PORT = '1.0.8802.1.1.2.1.3.7.1'
@@ -61,6 +63,7 @@ class TopologySnapshot:
     system_name: str = ''
     neighbors: list[Neighbor] = field(default_factory=list)
     observed_at: str = ''
+    fdb_entries: list[FDBEntry] = field(default_factory=list)
 
 
 def _as_mac(value: str) -> str:
@@ -108,7 +111,7 @@ def parse_lldp(source_ip: str, values: Mapping[str, str], observed_at: str = '')
             remote_chassis=_as_mac(cols.get(COL_CHASSIS, '')),
             remote_description=cols.get(COL_SYS_DESC, '').strip(),
         ))
-    return TopologySnapshot(source_ip, system_name, neighbors, observed_at)
+    return TopologySnapshot(source_ip, system_name, neighbors, observed_at, parse_fdb(values))
 
 
 def _hostname_keys(name: str) -> set[str]:
@@ -178,12 +181,14 @@ async def _snmp_walk(host: str, credentials: SNMPCredentials) -> dict[str, str]:
             for oid, value in status[3]:
                 values[oid.prettyPrint()] = value.prettyPrint()
         # Avoid unbounded remote walks. A large switch requires a deliberate limit.
-        for root in (LLDP_LOCAL_PORT, LLDP_REMOTE):
+        for root in (LLDP_LOCAL_PORT, LLDP_REMOTE, *FDB_WALK_ROOTS):
             async for error_ind, error_status, _error_idx, rows in walk_cmd(
                     engine, auth, target, context, ObjectType(ObjectIdentity(root)),
                     lookupMib=False, lexicographicMode=False, maxRows=700, maxCalls=700):
                 if error_ind or error_status:
-                    raise RuntimeError('SNMP: нет ответа или отказ в чтении LLDP-MIB')
+                    if root in (LLDP_LOCAL_PORT, LLDP_REMOTE):
+                        raise RuntimeError('SNMP: нет ответа или отказ в чтении LLDP-MIB')
+                    break  # An optional FDB/IF-MIB table may be absent or denied.
                 for oid, value in rows:
                     key = oid.prettyPrint()
                     if key.startswith(root + '.'):
@@ -203,4 +208,8 @@ def read_lldp(host: str, credentials: SNMPCredentials) -> TopologySnapshot:
     if not address.is_private or address.is_loopback or address.is_link_local:
         raise ValueError('SNMP доступен только для адресов частной локальной сети')
     credentials.validate()
-    return parse_lldp(str(address), asyncio.run(_snmp_walk(str(address), credentials)), now_iso())
+    try:
+        values = asyncio.run(asyncio.wait_for(_snmp_walk(str(address), credentials), timeout=30))
+    except TimeoutError as exc:
+        raise RuntimeError('SNMP: истёк тайм-аут опроса') from exc
+    return parse_lldp(str(address), values, now_iso())
