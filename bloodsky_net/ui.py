@@ -16,6 +16,7 @@ from . import __version__
 from . import network as net
 from . import wifi
 from . import topology
+from . import fdb
 from .storage import Storage
 
 BG = "#0B1220"
@@ -43,6 +44,12 @@ class NetApp(tk.Tk):
         self.devices: dict[str, net.Device] = self.store.load_devices()
         self.topology_snapshots: dict[str, topology.TopologySnapshot] = {}
         self.snmp_busy = False
+        self.snmp_profiles: dict[str, topology.SNMPCredentials] = {}  # RAM only
+        self.snmp_due: dict[str, float] = {}
+        self.topology_received: dict[str, float] = {}
+        self.topology_failed: set[str] = set()
+        self.snmp_auto_enabled = False
+        self.snmp_interval = 60
         self.state_lock = threading.Lock()
         self.messages: queue.Queue = queue.Queue()
         self.scan_stop = threading.Event()
@@ -77,6 +84,7 @@ class NetApp(tk.Tk):
         self._refresh_ui()
         self.after(150, self._drain)
         self.after(1100, self._traffic_tick)
+        self.after(1000, self._snmp_tick)
         self._read_wifi_background()
 
     def _style(self):
@@ -280,6 +288,7 @@ class NetApp(tk.Tk):
                     color=MUTED).pack(side="left")
         self._button(top, "Сохранить карту SVG", self.export_map).pack(side="right", padx=(8, 0))
         self._button(top, "Опрос SNMP/LLDP", self._snmp_dialog, primary=True).pack(side="right")
+        self._button(top, "Стоп автоопрос", self._stop_snmp_auto).pack(side="right", padx=(0, 8))
         shell = self._panel(parent)
         shell.pack(fill="both", expand=True)
         self.map_canvas = tk.Canvas(shell, bg=PANEL, highlightthickness=0, scrollregion=(0, 0, 1300, 850))
@@ -300,6 +309,14 @@ class NetApp(tk.Tk):
         frame.configure(height=155)
         self.neighbor_table.configure(height=4)
         frame.pack(fill="x")
+        self.fdb_note = self._label(parent, "FDB: ещё нет данных. Изученные MAC/порты — не подтверждение физического кабеля.",
+                                    9, color=MUTED)
+        self.fdb_note.pack(anchor="w", pady=(7, 3))
+        fdb_frame, self.fdb_table = self._tree(parent,
+            ("Коммутатор", "MAC (изучен)", "Порт", "VLAN", "IP (по MAC)"),
+            (125, 165, 155, 80, 155))
+        self.fdb_table.configure(height=4)
+        fdb_frame.pack(fill="x")
 
     def _page_wifi(self):
         parent = self._new_page("Wi-Fi")
@@ -477,13 +494,19 @@ class NetApp(tk.Tk):
                     self.snmp_busy = False
                     snapshot = item[1]
                     self.topology_snapshots[snapshot.source_ip] = snapshot
-                    self._event("info", "LLDP опрос", f"{snapshot.source_ip}: {len(snapshot.neighbors)} соседей")
+                    self.topology_received[snapshot.source_ip] = time.monotonic()
+                    self.topology_failed.discard(snapshot.source_ip)
+                    self.snmp_due[snapshot.source_ip] = time.monotonic() + self.snmp_interval
+                    self._event("info", "SNMP опрос", f"{snapshot.source_ip}: LLDP {len(snapshot.neighbors)}, FDB {len(snapshot.fdb_entries)}")
                     self._set_status(f"SNMP {snapshot.source_ip}: найдено {len(snapshot.neighbors)} LLDP соседей")
                     self._dirty = True
                 elif kind == "topology_error":
                     self.snmp_busy = False
-                    self._set_status(f"Ошибка SNMP/LLDP: {item[1]}")
-                    self._event("warning", "SNMP/LLDP", item[1])
+                    self.topology_failed.add(item[1])
+                    self.snmp_due[item[1]] = time.monotonic() + self.snmp_interval
+                    self._set_status(f"SNMP {item[1]}: ошибка чтения, снимок помечен устаревшим")
+                    self._event("warning", "SNMP/LLDP", f"{item[1]}: опрос не удался (проверьте SNMP/ACL)")
+                    self._dirty = True
                 elif kind == "tool":
                     self._console_text(item[1])
                     self.tool_button.configure(state="normal")
@@ -496,6 +519,36 @@ class NetApp(tk.Tk):
             self._dirty = False
             self._last_paint = time.monotonic()
         self.after(140, self._drain)
+
+    def _fresh_topology(self):
+        """Never display stale observations as verified current LLDP links."""
+        now = time.monotonic()
+        maximum_age = max(120, self.snmp_interval * 2 + 30)
+        return {ip: snap for ip, snap in self.topology_snapshots.items()
+                if ip not in self.topology_failed
+                and now - self.topology_received.get(ip, float('-inf')) <= maximum_age}
+
+    def _snmp_tick(self):
+        if self._closed:
+            return
+        if self.snmp_auto_enabled and not self.snmp_busy:
+            due = [(t, ip) for ip, t in self.snmp_due.items()
+                   if ip in self.snmp_profiles and t <= time.monotonic()]
+            if due:
+                _t, ip = min(due)
+                self.snmp_busy = True
+                self.snmp_due[ip] = time.monotonic() + self.snmp_interval
+                threading.Thread(target=self._snmp_worker,
+                                 args=(ip, self.snmp_profiles[ip]), daemon=True).start()
+        if self.current_page == 'Карта сети' and self.topology_snapshots:
+            self._dirty = True  # TTL and stale labels continue updating without new packets.
+        self.after(1000, self._snmp_tick)
+
+    def _stop_snmp_auto(self):
+        self.snmp_auto_enabled = False
+        self.snmp_profiles.clear()  # forget all secrets immediately
+        self.snmp_due.clear()
+        self._set_status('SNMP автоопрос отключён. Учётные данные удалены из памяти профилей.')
 
     def _scan_finished(self):
         self.scanning = False
@@ -602,6 +655,7 @@ class NetApp(tk.Tk):
         elif self.current_page == "Карта сети":
             self._draw_map(all_devices)
             self._paint_neighbors(all_devices)
+            self._paint_fdb(all_devices)
         elif self.current_page == "Wi-Fi":
             self._paint_wifi()
         elif self.current_page == "События":
@@ -697,7 +751,7 @@ class NetApp(tk.Tk):
         width = max(canvas.winfo_width(), 880)
         height = max(canvas.winfo_height(), 590)
         center_x, center_y = width // 2, max(280, height // 2)
-        canvas.create_text(24, 22, text=f"КАРТА · {len(devices)} устройств · LLDP подтверждённые связи: {len(topology.physical_links(self.topology_snapshots, devices))}", fill=MUTED,
+        canvas.create_text(24, 22, text=f"КАРТА · {len(devices)} устройств · LLDP подтверждённые связи: {len(topology.physical_links(self._fresh_topology(), devices))}", fill=MUTED,
                            anchor="w", font=("Segoe UI Semibold", 10))
         canvas.create_oval(center_x - 68, center_y - 46, center_x + 68, center_y + 46,
                            fill="#1B4566", outline=BLUE, width=2)
@@ -728,7 +782,7 @@ class NetApp(tk.Tk):
                                        max_x, max_y))
         for dev, x, y in positions:
             canvas.create_line(center_x, center_y, x, y, fill="#2D4761", width=1, dash=(4, 4))
-        physical = topology.physical_links(self.topology_snapshots, devices)
+        physical = topology.physical_links(self._fresh_topology(), devices)
         point_by_ip = {dev.ip: (x, y) for dev, x, y in positions}
         for source, target, neighbor in physical:
             if source not in point_by_ip or target not in point_by_ip:
@@ -760,7 +814,10 @@ class NetApp(tk.Tk):
         self.neighbor_table.delete(*self.neighbor_table.get_children())
         total = 0
         matched = 0
+        fresh = self._fresh_topology()
         for source, snapshot in sorted(self.topology_snapshots.items()):
+            if source not in fresh:
+                continue  # stale snapshot must not masquerade as a live LLDP link
             for neighbor in snapshot.neighbors:
                 total += 1
                 target = topology.resolve_neighbor_ip(neighbor, devices)
@@ -768,8 +825,25 @@ class NetApp(tk.Tk):
                 self.neighbor_table.insert("", "end", values=(
                     source, neighbor.local_port, neighbor.remote_name or neighbor.remote_chassis or "неизвестно",
                     neighbor.remote_port or "—", target or "не определён"))
-        self.topology_note.configure(text=f"LLDP: {total} наблюдений, {matched} сопоставлено с найденными IP. "
-                                          "Синий сплошной — LLDP; пунктир — логическая схема, не кабель.")
+        stale = len(self.topology_snapshots) - len(fresh)
+        self.topology_note.configure(text=f"LLDP: {total} актуальных, {matched} сопоставлено, {stale} устаревших устройств. "
+                                          "Синий — LLDP; пунктир — логическая схема, не кабель.")
+
+    def _paint_fdb(self, devices):
+        self.fdb_table.delete(*self.fdb_table.get_children())
+        count = 0
+        fresh = self._fresh_topology()
+        for ip, snapshot in sorted(fresh.items()):
+            for row in snapshot.fdb_entries:
+                count += 1
+                if count > 250:
+                    continue
+                self.fdb_table.insert('', 'end', values=(
+                    ip, row.mac, row.interface,
+                    str(row.vlan) if row.vlan is not None else 'не определён',
+                    fdb.resolve_fdb_ip(row, devices) or '—'))
+        self.fdb_note.configure(text=f"FDB: {count} записей (первые 250). MAC ↔ порт — таблица обучения, "
+                                     "не физический кабель. VLAN указан только при однозначном соответствии FDB ID.")
 
     def _snmp_dialog(self):
         if self.snmp_busy:
@@ -777,7 +851,7 @@ class NetApp(tk.Tk):
             return
         popup = tk.Toplevel(self)
         popup.title("SNMP/LLDP · только чтение")
-        popup.geometry("485x420")
+        popup.geometry("485x510")
         popup.resizable(False, False)
         popup.configure(bg=PANEL)
         popup.transient(self)
@@ -789,6 +863,8 @@ class NetApp(tk.Tk):
         auth_key = tk.StringVar()
         priv_key = tk.StringVar()
         port = tk.StringVar(value="161")
+        auto = tk.BooleanVar(value=False)
+        interval = tk.StringVar(value="60")
         lines = [("IPv4 коммутатора/маршрутизатора", host, False),
                  ("Версия: v3 по умолчанию (SHA-256 + AES128)", version, False),
                  ("Пользователь SNMPv3", username, False),
@@ -807,6 +883,14 @@ class NetApp(tk.Tk):
                 tk.Entry(row, textvariable=variable, width=19, show="*" if secret else "",
                          bg=PANEL_ALT, fg=TEXT, insertbackground=TEXT, relief="flat").pack(side="right", ipady=3)
 
+        auto_row = tk.Frame(popup, bg=PANEL)
+        auto_row.pack(fill='x', padx=15, pady=(9, 0))
+        tk.Checkbutton(auto_row, text='Автоопрос (пароли только в памяти)', variable=auto,
+                       bg=PANEL, fg=TEXT, selectcolor=BG, activebackground=PANEL,
+                       activeforeground=TEXT).pack(side='left')
+        ttk.Combobox(auto_row, textvariable=interval, state='readonly',
+                     values=('30', '60', '120', '300'), width=5).pack(side='right')
+        self._label(popup, 'Интервал автоопроса, секунд (30–300)', 9, color=MUTED).pack(anchor='e', padx=16)
         self._label(popup, "Данные не сохраняются. SNMP запросы только GET/WALK; "
                     "используйте доступ к своему оборудованию.", 9, color=MUTED,
                     wraplength=435, justify="left").pack(anchor="w", padx=16, pady=10)
@@ -824,6 +908,14 @@ class NetApp(tk.Tk):
                 messagebox.showwarning("Параметры SNMP", str(exc), parent=popup)
                 return
             popup.destroy()
+            if auto.get():
+                self.snmp_interval = int(interval.get())
+                self.snmp_profiles[ip] = credentials
+                self.snmp_due[ip] = time.monotonic() + self.snmp_interval
+                self.snmp_auto_enabled = True
+            else:
+                self.snmp_profiles.pop(ip, None)
+                self.snmp_due.pop(ip, None)
             self.snmp_busy = True
             self._set_status(f"Опрос LLDP {ip}: выполняется...")
             threading.Thread(target=self._snmp_worker, args=(ip, credentials), daemon=True).start()
@@ -836,7 +928,7 @@ class NetApp(tk.Tk):
             self.messages.put(("topology", snapshot))
         except Exception as exc:
             # Exceptions can contain transport hostnames; never log any credentials.
-            self.messages.put(("topology_error", f"{ip}: {str(exc)[:160]}" if isinstance(exc, (ValueError, RuntimeError)) else f"{ip}: {type(exc).__name__} (проверьте SNMP-доступ и UDP/161)"))
+            self.messages.put(("topology_error", ip))
 
     def _map_pick(self, ip):
         self.selected_ip = ip
@@ -970,7 +1062,7 @@ class NetApp(tk.Tk):
         parts += [f'<circle cx="{center}" cy="{center}" r="59" fill="#1B4566" stroke="{BLUE}" stroke-width="2"/>',
                   f'<text x="{center}" y="{center + 5}" text-anchor="middle" fill="{TEXT}" font-size="17" font-family="Segoe UI,sans-serif">LAN</text>']
         by_ip = {d.ip: (center + dx, center + dy) for d, dx, dy in positions}
-        for source, target, neighbor in topology.physical_links(self.topology_snapshots, devices):
+        for source, target, neighbor in topology.physical_links(self._fresh_topology(), devices):
             if source in by_ip and target in by_ip:
                 x1, y1 = by_ip[source]
                 x2, y2 = by_ip[target]
@@ -998,6 +1090,9 @@ class NetApp(tk.Tk):
         self._closed = True
         self.scan_stop.set()
         self.monitor_stop.set()
+        self.snmp_auto_enabled = False
+        self.snmp_profiles.clear()
+        self.snmp_due.clear()
         try:
             self.store.close()
         except Exception:
