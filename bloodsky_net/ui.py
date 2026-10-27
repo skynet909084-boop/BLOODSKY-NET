@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import __version__
 from . import network as net
 from . import wifi
+from . import topology
 from .storage import Storage
 
 BG = "#0B1220"
@@ -40,6 +41,8 @@ class NetApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.shutdown)
         self.store = Storage()
         self.devices: dict[str, net.Device] = self.store.load_devices()
+        self.topology_snapshots: dict[str, topology.TopologySnapshot] = {}
+        self.snmp_busy = False
         self.state_lock = threading.Lock()
         self.messages: queue.Queue = queue.Queue()
         self.scan_stop = threading.Event()
@@ -275,7 +278,8 @@ class NetApp(tk.Tk):
         top.pack(fill="x", pady=(0, 10))
         self._label(top, "Зелёный — доступен     Красный — недоступен     Жёлтый — конфликт под вопросом", 10,
                     color=MUTED).pack(side="left")
-        self._button(top, "Сохранить карту SVG", self.export_map).pack(side="right")
+        self._button(top, "Сохранить карту SVG", self.export_map).pack(side="right", padx=(8, 0))
+        self._button(top, "Опрос SNMP/LLDP", self._snmp_dialog, primary=True).pack(side="right")
         shell = self._panel(parent)
         shell.pack(fill="both", expand=True)
         self.map_canvas = tk.Canvas(shell, bg=PANEL, highlightthickness=0, scrollregion=(0, 0, 1300, 850))
@@ -287,6 +291,15 @@ class NetApp(tk.Tk):
         self.map_canvas.pack(side="left", fill="both", expand=True)
         self.map_canvas.bind("<Configure>", lambda e: self._draw_map())
         self.map_canvas.bind("<MouseWheel>", lambda e: self.map_canvas.yview_scroll(-int(e.delta / 120), "units"))
+        self.topology_note = self._label(parent, "LLDP: ещё не опрашивались управляемые устройства. Сплошная линия — подтверждённый LLDP-сосед.",
+                                         9, color=MUTED)
+        self.topology_note.pack(anchor="w", pady=(8, 5))
+        frame, self.neighbor_table = self._tree(parent,
+            ("SNMP IP", "Порт устройства", "Сосед LLDP", "Порт соседа", "Совпадение IP"),
+            (125, 145, 200, 150, 135))
+        frame.configure(height=155)
+        self.neighbor_table.configure(height=4)
+        frame.pack(fill="x")
 
     def _page_wifi(self):
         parent = self._new_page("Wi-Fi")
@@ -460,6 +473,17 @@ class NetApp(tk.Tk):
                     self._update_monitor(item[1], item[2])
                 elif kind == "wifi":
                     self._update_wifi(item[1])
+                elif kind == "topology":
+                    self.snmp_busy = False
+                    snapshot = item[1]
+                    self.topology_snapshots[snapshot.source_ip] = snapshot
+                    self._event("info", "LLDP опрос", f"{snapshot.source_ip}: {len(snapshot.neighbors)} соседей")
+                    self._set_status(f"SNMP {snapshot.source_ip}: найдено {len(snapshot.neighbors)} LLDP соседей")
+                    self._dirty = True
+                elif kind == "topology_error":
+                    self.snmp_busy = False
+                    self._set_status(f"Ошибка SNMP/LLDP: {item[1]}")
+                    self._event("warning", "SNMP/LLDP", item[1])
                 elif kind == "tool":
                     self._console_text(item[1])
                     self.tool_button.configure(state="normal")
@@ -577,6 +601,7 @@ class NetApp(tk.Tk):
             self._paint_devices(all_devices)
         elif self.current_page == "Карта сети":
             self._draw_map(all_devices)
+            self._paint_neighbors(all_devices)
         elif self.current_page == "Wi-Fi":
             self._paint_wifi()
         elif self.current_page == "События":
@@ -672,7 +697,7 @@ class NetApp(tk.Tk):
         width = max(canvas.winfo_width(), 880)
         height = max(canvas.winfo_height(), 590)
         center_x, center_y = width // 2, max(280, height // 2)
-        canvas.create_text(24, 22, text=f"ЛОГИЧЕСКАЯ КАРТА · {len(devices)} устройств", fill=MUTED,
+        canvas.create_text(24, 22, text=f"КАРТА · {len(devices)} устройств · LLDP подтверждённые связи: {len(topology.physical_links(self.topology_snapshots, devices))}", fill=MUTED,
                            anchor="w", font=("Segoe UI Semibold", 10))
         canvas.create_oval(center_x - 68, center_y - 46, center_x + 68, center_y + 46,
                            fill="#1B4566", outline=BLUE, width=2)
@@ -703,6 +728,17 @@ class NetApp(tk.Tk):
                                        max_x, max_y))
         for dev, x, y in positions:
             canvas.create_line(center_x, center_y, x, y, fill="#2D4761", width=1, dash=(4, 4))
+        physical = topology.physical_links(self.topology_snapshots, devices)
+        point_by_ip = {dev.ip: (x, y) for dev, x, y in positions}
+        for source, target, neighbor in physical:
+            if source not in point_by_ip or target not in point_by_ip:
+                continue
+            x1, y1 = point_by_ip[source]
+            x2, y2 = point_by_ip[target]
+            canvas.create_line(x1, y1, x2, y2, fill=BLUE, width=3)
+            canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2 - 9,
+                               text=f"{neighbor.local_port} ↔ {neighbor.remote_port}"[:34],
+                               fill=BLUE, font=("Segoe UI", 9))
         for dev, x, y in positions:
             key = f"host:{dev.ip}"
             color = YELLOW if dev.ip in self.ip_alerts else (GREEN if dev.online else RED)
@@ -719,6 +755,88 @@ class NetApp(tk.Tk):
         if not devices:
             canvas.create_text(center_x, center_y + 85, text="Начните сканирование подсети для построения карты",
                                fill=MUTED, font=("Segoe UI", 12))
+
+    def _paint_neighbors(self, devices):
+        self.neighbor_table.delete(*self.neighbor_table.get_children())
+        total = 0
+        matched = 0
+        for source, snapshot in sorted(self.topology_snapshots.items()):
+            for neighbor in snapshot.neighbors:
+                total += 1
+                target = topology.resolve_neighbor_ip(neighbor, devices)
+                matched += bool(target)
+                self.neighbor_table.insert("", "end", values=(
+                    source, neighbor.local_port, neighbor.remote_name or neighbor.remote_chassis or "неизвестно",
+                    neighbor.remote_port or "—", target or "не определён"))
+        self.topology_note.configure(text=f"LLDP: {total} наблюдений, {matched} сопоставлено с найденными IP. "
+                                          "Синий сплошной — LLDP; пунктир — логическая схема, не кабель.")
+
+    def _snmp_dialog(self):
+        if self.snmp_busy:
+            messagebox.showinfo("SNMP", "Опрос уже выполняется", parent=self)
+            return
+        popup = tk.Toplevel(self)
+        popup.title("SNMP/LLDP · только чтение")
+        popup.geometry("485x420")
+        popup.resizable(False, False)
+        popup.configure(bg=PANEL)
+        popup.transient(self)
+        popup.grab_set()
+        host = tk.StringVar(value=self.selected_ip or self.gateway or "")
+        version = tk.StringVar(value="v3")
+        username = tk.StringVar()
+        community = tk.StringVar()
+        auth_key = tk.StringVar()
+        priv_key = tk.StringVar()
+        port = tk.StringVar(value="161")
+        lines = [("IPv4 коммутатора/маршрутизатора", host, False),
+                 ("Версия: v3 по умолчанию (SHA-256 + AES128)", version, False),
+                 ("Пользователь SNMPv3", username, False),
+                 ("Пароль аутентификации SNMPv3", auth_key, True),
+                 ("Пароль шифрования SNMPv3", priv_key, True),
+                 ("Community SNMPv2c (только чтение)", community, True),
+                 ("UDP порт", port, False)]
+        for caption, variable, secret in lines:
+            row = tk.Frame(popup, bg=PANEL)
+            row.pack(fill="x", padx=15, pady=3)
+            self._label(row, caption, 9, color=TEXT).pack(side="left", anchor="w")
+            if variable is version:
+                ttk.Combobox(row, textvariable=version, values=("v3", "v2c"),
+                             state="readonly", width=7).pack(side="right")
+            else:
+                tk.Entry(row, textvariable=variable, width=19, show="*" if secret else "",
+                         bg=PANEL_ALT, fg=TEXT, insertbackground=TEXT, relief="flat").pack(side="right", ipady=3)
+
+        self._label(popup, "Данные не сохраняются. SNMP запросы только GET/WALK; "
+                    "используйте доступ к своему оборудованию.", 9, color=MUTED,
+                    wraplength=435, justify="left").pack(anchor="w", padx=16, pady=10)
+
+        def submit():
+            try:
+                credentials = topology.SNMPCredentials(version=version.get(), username=username.get(),
+                    auth_key=auth_key.get(), priv_key=priv_key.get(), community=community.get(),
+                    port=int(port.get()))
+                credentials.validate()
+                ip = str(ipaddress.IPv4Address(host.get().strip()))
+                if not ipaddress.IPv4Address(ip).is_private:
+                    raise ValueError("Укажите локальный частный IPv4-адрес")
+            except (ValueError, ipaddress.AddressValueError) as exc:
+                messagebox.showwarning("Параметры SNMP", str(exc), parent=popup)
+                return
+            popup.destroy()
+            self.snmp_busy = True
+            self._set_status(f"Опрос LLDP {ip}: выполняется...")
+            threading.Thread(target=self._snmp_worker, args=(ip, credentials), daemon=True).start()
+
+        self._button(popup, "Получить LLDP-соседей", submit, primary=True).pack(pady=5)
+
+    def _snmp_worker(self, ip, credentials):
+        try:
+            snapshot = topology.read_lldp(ip, credentials)
+            self.messages.put(("topology", snapshot))
+        except Exception as exc:
+            # Exceptions can contain transport hostnames; never log any credentials.
+            self.messages.put(("topology_error", f"{ip}: {str(exc)[:160]}" if isinstance(exc, (ValueError, RuntimeError)) else f"{ip}: {type(exc).__name__} (проверьте SNMP-доступ и UDP/161)"))
 
     def _map_pick(self, ip):
         self.selected_ip = ip
@@ -845,12 +963,20 @@ class NetApp(tk.Tk):
         center = width / 2
         parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
                  f'<rect width="100%" height="100%" fill="{PANEL}"/>',
-                 f'<text x="28" y="34" font-family="Segoe UI,sans-serif" font-size="20" fill="{TEXT}">BLOODSKY NET — логическая карта сети</text>']
+                 f'<text x="28" y="34" font-family="Segoe UI,sans-serif" font-size="20" fill="{TEXT}">BLOODSKY NET — карта сети (LLDP — сплошные линии)</text>']
         for d, dx, dy in positions:
             x, y = center + dx, center + dy
             parts.append(f'<line x1="{center}" y1="{center}" x2="{x:.1f}" y2="{y:.1f}" stroke="{BORDER}" stroke-dasharray="5 6"/>')
         parts += [f'<circle cx="{center}" cy="{center}" r="59" fill="#1B4566" stroke="{BLUE}" stroke-width="2"/>',
                   f'<text x="{center}" y="{center + 5}" text-anchor="middle" fill="{TEXT}" font-size="17" font-family="Segoe UI,sans-serif">LAN</text>']
+        by_ip = {d.ip: (center + dx, center + dy) for d, dx, dy in positions}
+        for source, target, neighbor in topology.physical_links(self.topology_snapshots, devices):
+            if source in by_ip and target in by_ip:
+                x1, y1 = by_ip[source]
+                x2, y2 = by_ip[target]
+                parts.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="{BLUE}" stroke-width="3"/>')
+                port_label = escape((neighbor.local_port + ' ↔ ' + neighbor.remote_port)[:34])
+                parts.append(f'<text x="{(x1+x2)/2:.1f}" y="{(y1+y2)/2-9:.1f}" text-anchor="middle" fill="{BLUE}" font-size="11">{port_label}</text>')
         for d, dx, dy in positions:
             x, y = center + dx, center + dy
             color = YELLOW if d.ip in self.ip_alerts else (GREEN if d.online else RED)

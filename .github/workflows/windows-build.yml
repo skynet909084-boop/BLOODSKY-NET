@@ -17,12 +17,14 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install -r requirements.txt "pyinstaller>=6,<7"
+      - name: Validate SNMP imports
+        run: python -c "from pysnmp.hlapi.v3arch.asyncio import SnmpEngine, walk_cmd, USM_AUTH_HMAC192_SHA256, USM_PRIV_CFB128_AES"
       - name: Compile and test
         run: |
           python -m compileall -q app.py bloodsky_net
           python -m unittest discover -s tests -v
       - name: Build portable EXE
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name BLOODSKY-NET app.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all pysnmp --collect-all Cryptodome --name BLOODSKY-NET app.py
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
