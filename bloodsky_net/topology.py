@@ -13,6 +13,7 @@ from typing import Mapping, Sequence
 
 from .fdb import FDBEntry, FDB_WALK_ROOTS, parse_fdb
 from .traffic import PortCounter, TRAFFIC_WALK_ROOTS, parse_port_counters
+from .port_health import ErrorCounters, ERROR_WALK_ROOTS, parse_error_counters
 
 # Numeric OIDs intentionally avoid dependency on vendor MIB files.
 LLDP_REMOTE = '1.0.8802.1.1.2.1.4.1.1'
@@ -66,6 +67,7 @@ class TopologySnapshot:
     observed_at: str = ''
     fdb_entries: list[FDBEntry] = field(default_factory=list)
     port_counters: dict[int, PortCounter] = field(default_factory=dict)
+    error_counters: dict[int, ErrorCounters] = field(default_factory=dict)
 
 
 def _as_mac(value: str) -> str:
@@ -114,7 +116,7 @@ def parse_lldp(source_ip: str, values: Mapping[str, str], observed_at: str = '')
             remote_description=cols.get(COL_SYS_DESC, '').strip(),
         ))
     return TopologySnapshot(source_ip, system_name, neighbors, observed_at,
-                            parse_fdb(values), parse_port_counters(values))
+                            parse_fdb(values), parse_port_counters(values), parse_error_counters(values))
 
 
 def _hostname_keys(name: str) -> set[str]:
@@ -184,7 +186,7 @@ async def _snmp_walk(host: str, credentials: SNMPCredentials) -> dict[str, str]:
             for oid, value in status[3]:
                 values[oid.prettyPrint()] = value.prettyPrint()
         # Avoid unbounded remote walks. A large switch requires a deliberate limit.
-        for root in (LLDP_LOCAL_PORT, LLDP_REMOTE, *FDB_WALK_ROOTS, *TRAFFIC_WALK_ROOTS):
+        for root in (LLDP_LOCAL_PORT, LLDP_REMOTE, *FDB_WALK_ROOTS, *TRAFFIC_WALK_ROOTS, *ERROR_WALK_ROOTS):
             async for error_ind, error_status, _error_idx, rows in walk_cmd(
                     engine, auth, target, context, ObjectType(ObjectIdentity(root)),
                     lookupMib=False, lexicographicMode=False, maxRows=700, maxCalls=700):
