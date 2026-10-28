@@ -4,3 +4,4 @@ pycryptodomex>=3.20,<4
 winotify>=1.1,<2
 pystray>=0.19,<1
 Pillow>=10,<13
+cryptography>=43,<47
