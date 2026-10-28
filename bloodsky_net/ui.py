@@ -72,8 +72,13 @@ class NetApp(tk.Tk):
         self.traffic_last_rate = (0.0, 0.0)
         self.mac_history = net.MacHistory()
         self.ip_alerts: dict[str, net.MacChange] = {}
+        self.ip_alert_expiry: dict[str, float] = {}
+        self.alerts_enabled = tk.BooleanVar(value=True)
+        self.alert_last: dict[tuple[str, str, str], float] = {}
+        self.alert_token = 0
+        self.wifi_last_saved = float('-inf')
         self.latency_history: deque[float | None] = deque(maxlen=100)
-        self.signal_history: deque[float | None] = deque(maxlen=100)
+        self.signal_history: deque[float | None] = deque(self.store.wifi_signal_history(100), maxlen=100)
         self.traffic_samples: deque[tuple[float, dict]] = deque(maxlen=2)
         self.selected_ip = ""
         self._dirty = False
@@ -199,6 +204,8 @@ class NetApp(tk.Tk):
         self._page_wifi()
         self._page_tools()
         self._page_events()
+        self.alert_banner = self._label(right, "", 10, True, YELLOW)
+        self.alert_banner.pack(fill="x", anchor="w", padx=26, pady=(0, 4))
         self.status_line = self._label(right, "Ожидание сканирования локальной сети", 9, color=MUTED)
         self.status_line.pack(fill="x", anchor="w", padx=26, pady=(0, 15))
         self.show_page("Обзор")
@@ -329,6 +336,10 @@ class NetApp(tk.Tk):
         self.wifi_status_label.pack(anchor="w", pady=(0, 8))
         self.wifi_warning_label = self._label(parent, "", 10, color=YELLOW, wraplength=850, justify="left")
         self.wifi_warning_label.pack(anchor="w", pady=(0, 14))
+        self._label(parent, "ИСТОРИЯ СИГНАЛА WI-FI (локально, до 7 дней)", 10, True, MUTED).pack(anchor="w", pady=(0, 6))
+        self.wifi_signal_canvas = tk.Canvas(parent, bg=PANEL, highlightthickness=0, height=110)
+        self.wifi_signal_canvas.pack(fill="x", pady=(0, 14))
+        self.wifi_signal_canvas.bind("<Configure>", lambda _e: self._draw_curve(self.wifi_signal_canvas, list(self.signal_history), BLUE, 100))
         self._label(parent, "ТОЧКИ ДОСТУПА В ЗОНЕ ВИДИМОСТИ", 10, True, MUTED).pack(anchor="w", pady=(0, 9))
         frame, self.wifi_table = self._tree(parent,
             ("SSID", "BSSID", "Сигнал", "Канал", "Диапазон*", "Защита", "Стандарт"),
@@ -373,6 +384,9 @@ class NetApp(tk.Tk):
         parent = self._new_page("События")
         self._label(parent, "Все изменения состояний и предупреждения сохраняются в локальной базе SQLite.",
                     10, color=MUTED).pack(anchor="w", pady=(0, 12))
+        tk.Checkbutton(parent, text="Показывать предупреждения внутри окна", variable=self.alerts_enabled,
+                       bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+                       activeforeground=TEXT, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 8))
         frame, self.events_table = self._tree(parent,
             ("Дата/время", "Уровень", "Событие", "Подробности"),
             (195, 125, 225, 630))
@@ -574,10 +588,18 @@ class NetApp(tk.Tk):
             self._start_monitor()
 
     def _observe_neighbors(self, neighbors):
+        now = time.monotonic()
+        for ip, deadline in list(self.ip_alert_expiry.items()):
+            if now >= deadline:
+                self.ip_alert_expiry.pop(ip, None)
+                self.ip_alerts.pop(ip, None)
         for change in self.mac_history.ingest(neighbors):
-            self.ip_alerts[change.ip] = change
-            self._event("warning", "Возможный IP-конфликт",
-                        f"{change.ip}: MAC изменился с {change.previous} на {change.current}. Возможна смена DHCP, VRRP или ошибка ARP; требуется проверка.")
+            if change.severity == "warning":
+                self.ip_alerts[change.ip] = change
+                self.ip_alert_expiry[change.ip] = now + 900
+            self._event(change.severity,
+                        "Подозрение на IP-конфликт" if change.severity == "warning" else "ARP: смена MAC",
+                        f"{change.ip}: {change.previous} → {change.current}, переходов за 3 мин: {change.switches}. DHCP, VRRP и кеш ARP могут давать такие изменения; подтверждение требует анализа DHCP/пакетов.")
         with self.state_lock:
             for ip, mac in neighbors.items():
                 if ip in self.devices and mac:
@@ -627,6 +649,10 @@ class NetApp(tk.Tk):
         self.wifi_previously_observed = True
         self.wifi_report = report
         self.signal_history.append(float(state.signal) if state.connected else None)
+        now = time.monotonic()
+        if now - self.wifi_last_saved >= 30:
+            self.store.save_wifi_sample(state.connected, state.ssid, state.bssid, state.signal, state.channel)
+            self.wifi_last_saved = now
         warning = " | ".join(report.warnings)
         if warning and warning != self.wifi_warning_previous:
             self._event("warning", "Диагностика Wi-Fi", warning)
@@ -635,6 +661,20 @@ class NetApp(tk.Tk):
 
     def _event(self, severity, title, detail):
         self.store.event(severity, title, detail)
+        if severity not in ("warning", "error") or not self.alerts_enabled.get() or self._closed:
+            return
+        now = time.monotonic()
+        key = (severity, title, detail)
+        if now - self.alert_last.get(key, float('-inf')) < 120:
+            return
+        self.alert_last[key] = now
+        if len(self.alert_last) > 300:
+            self.alert_last = {k: t for k, t in self.alert_last.items() if now - t < 300}
+        self.alert_token += 1
+        token = self.alert_token
+        self.alert_banner.configure(text=f"{'СБОЙ' if severity == 'error' else 'ВНИМАНИЕ'} · {title}: {detail[:110]}",
+                                    fg=RED if severity == 'error' else YELLOW)
+        self.after(12000, lambda: self.alert_banner.configure(text="") if token == self.alert_token and not self._closed else None)
 
     def _refresh_ui(self):
         if not hasattr(self, "metrics"):
@@ -698,6 +738,7 @@ class NetApp(tk.Tk):
         self.wifi_current_label.configure(text=f"{state.ssid or 'Wi-Fi не подключён'}  ·  {state.signal if state.connected else 0}%")
         self.wifi_status_label.configure(text=f"Адаптер: {state.adapter or '—'}  |  BSSID: {state.bssid or '—'}  |  Канал: {state.channel or '—'}  |  Радио: {state.radio or '—'}")
         self.wifi_warning_label.configure(text="\n".join(report.warnings[:3]) or "Предупреждений не найдено")
+        self._draw_curve(self.wifi_signal_canvas, list(self.signal_history), BLUE, 100)
         self.wifi_table.delete(*self.wifi_table.get_children())
         for ap in sorted(report.aps, key=lambda item: item.signal, reverse=True):
             self.wifi_table.insert("", "end", values=(ap.ssid, ap.bssid,

@@ -343,28 +343,52 @@ class MacChange:
     previous: str
     current: str
     observed_at: str
+    severity: str = "info"  # one change is not evidence of an IP conflict
+    switches: int = 1
 
 
 class MacHistory:
-    """MAC switch is only a *possible* IP conflict, never conclusive proof."""
-    def __init__(self):
+    """Classify ARP MAC changes, never equate them with proven IP conflicts.
+
+    An isolated reassignment is informational. Two or more changes within three
+    minutes are elevated, but still only *suspected*: DHCP, VRRP and stale ARP
+    can produce the same observations. Old samples and dedupe keys expire.
+    """
+    def __init__(self, window_s: int = 180, cooldown_s: int = 120):
         self.known: dict[str, tuple[str, float]] = {}
-        self.alerted: set[tuple[str, str, str]] = set()
+        self.transitions: dict[str, list[float]] = {}
+        self.last_alert: dict[tuple[str, str, str, str], float] = {}
+        self.window_s = window_s
+        self.cooldown_s = cooldown_s
 
     def ingest(self, rows: dict[str, str], timestamp: float | None = None) -> list[MacChange]:
         t = timestamp if timestamp is not None else time.time()
         alerts = []
-        for ip, mac in rows.items():
-            mac = normalize_mac(mac)
+        self.last_alert = {key: at for key, at in self.last_alert.items()
+                           if 0 <= t - at < self.cooldown_s}
+        for ip, raw_mac in rows.items():
+            mac = normalize_mac(raw_mac)
             if not mac:
                 continue
-            previous = self.known.get(ip)
-            if previous and previous[0] != mac and t - previous[1] <= 900:
-                key = (ip, previous[0], mac)
-                if key not in self.alerted:
-                    alerts.append(MacChange(ip, previous[0], mac, now_iso()))
-                    self.alerted.add(key)
+            prior = self.known.get(ip)
+            times = [at for at in self.transitions.get(ip, []) if 0 <= t - at <= self.window_s]
+            if prior and prior[0] != mac:
+                if 0 <= t - prior[1] <= 900:
+                    times.append(t)
+                    level = "warning" if len(times) >= 2 else "info"
+                    key = (ip, prior[0], mac, level)
+                    if key not in self.last_alert:
+                        alerts.append(MacChange(ip, prior[0], mac, now_iso(), level, len(times)))
+                        self.last_alert[key] = t
+                else:
+                    times = []  # old bindings cannot establish a rapid change
+            self.transitions[ip] = times[-24:]
             self.known[ip] = (mac, t)
+        # Prevent unbounded growth when scanned hosts leave the network.
+        for ip in list(self.known):
+            if t - self.known[ip][1] > 3600:
+                self.known.pop(ip, None)
+                self.transitions.pop(ip, None)
         return alerts
 
 
