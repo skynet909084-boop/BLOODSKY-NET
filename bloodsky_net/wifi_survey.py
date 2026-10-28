@@ -27,6 +27,7 @@ class SurveyPoint:
     signal: int  # percentage provided by Windows WLAN; not dBm
     channel: int
     room: str = 'Без комнаты'
+    phase: str = 'Без этапа'
 
 
 @dataclass(frozen=True)
@@ -41,11 +42,13 @@ class ZoneQuality:
 
 def validate_point(zone: str, x: float, y: float, ssid: str,
                    bssid: str, signal: int, channel: int, observed_at: str,
-                   room: str = 'Без комнаты') -> SurveyPoint:
+                   room: str = 'Без комнаты', phase: str = 'Без этапа') -> SurveyPoint:
     if not isinstance(zone, str) or not zone.strip() or len(zone.strip()) > 60 or any(ord(c) < 32 for c in zone):
         raise ValueError('Название зоны: от 1 до 60 символов без управляющих знаков')
     if not isinstance(room, str) or not room.strip() or len(room.strip()) > 60 or any(ord(c) < 32 for c in room):
         raise ValueError('Название комнаты: от 1 до 60 символов без управляющих знаков')
+    if phase not in ('Без этапа', 'До', 'После'):
+        raise ValueError('Неизвестный этап измерения')
     if type(x) not in (int, float) or type(y) not in (int, float) or not 0 <= x <= 100 or not 0 <= y <= 100:
         raise ValueError('Координаты должны быть в пределах 0–100')
     if not isinstance(ssid, str) or not ssid or len(ssid) > 128 or not BSSID.fullmatch(str(bssid)):
@@ -61,7 +64,7 @@ def validate_point(zone: str, x: float, y: float, ssid: str,
     if ts.tzinfo is None:
         raise ValueError('Отметка времени без часового пояса')
     return SurveyPoint(ts.astimezone(timezone.utc).isoformat(), zone.strip(),
-                       round(float(x), 3), round(float(y), 3), ssid, bssid.upper(), signal, channel, room.strip())
+                       round(float(x), 3), round(float(y), 3), ssid, bssid.upper(), signal, channel, room.strip(), phase)
 
 
 def zone_quality(points: Sequence[SurveyPoint]) -> tuple[ZoneQuality, ...]:
@@ -103,3 +106,52 @@ def room_quality(points: Sequence[SurveyPoint], zone: str) -> tuple[ZoneQuality,
         result.append(ZoneQuality(room, len(values), round(sum(signals)/len(signals), 1),
                                   min(signals), max(signals), len({p.bssid for p in values})))
     return tuple(result)
+
+
+@dataclass(frozen=True)
+class RoomComparison:
+    room: str
+    ssid: str
+    before_samples: int
+    after_samples: int
+    before_mean: float
+    after_mean: float
+    delta: float
+
+
+def compare_phases(points: Sequence[SurveyPoint], zone: str, min_samples: int = 2) -> tuple[RoomComparison, ...]:
+    """Explicit before/after sample means for same floor, room, SSID. No inferred improvement.
+
+    Samples are not paired in time or measurement position: this is descriptive only.
+    Unlabelled historical samples and invalid sensor data never enter the comparison.
+    """
+    if type(min_samples) is not int or not 2 <= min_samples <= 30:
+        raise ValueError('Нужно не менее двух измерений в каждом этапе')
+    groups: dict[tuple[str, str], dict[str, list[int]]] = defaultdict(
+        lambda: {'До': [], 'После': []})
+    for p in points[:MAX_POINTS]:
+        if not isinstance(p, SurveyPoint) or p.zone != zone or p.phase not in ('До', 'После'):
+            continue
+        if type(p.signal) is not int or not 0 <= p.signal <= 100 or not p.room or not p.ssid:
+            continue
+        groups[(p.room, p.ssid)][p.phase].append(p.signal)
+    out = []
+    for (room, ssid), phases in sorted(groups.items())[:MAX_POINTS]:
+        before, after = phases['До'], phases['После']
+        if len(before) < min_samples or len(after) < min_samples:
+            continue
+        before_avg, after_avg = sum(before)/len(before), sum(after)/len(after)
+        out.append(RoomComparison(room, ssid, len(before), len(after),
+                                  round(before_avg, 1), round(after_avg, 1), round(after_avg-before_avg, 1)))
+    return tuple(out[:MAX_ZONES])
+
+
+def room_signal_status(quality: ZoneQuality, minimum: int = 3) -> str:
+    """Coloring requires repeated samples; not a confirmed throughput or connectivity issue."""
+    if quality.samples < minimum:
+        return 'insufficient'
+    if quality.mean_signal < 45:
+        return 'low'
+    if quality.mean_signal < 70:
+        return 'moderate'
+    return 'observed_good'
