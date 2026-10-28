@@ -2077,12 +2077,34 @@ class NetApp(tk.Tk):
                 item = self.messages.get_nowait()
                 count += 1
                 kind = item[0]
-                if kind == "found":
+                if kind == 'identity_results':
+                    self.identity_busy = False
+                    identified = 0
+                    with self.state_lock:
+                        for ip, identity in item[1].items():
+                            device = self.devices.get(ip)
+                            if device is None:
+                                continue
+                            device.friendly_name = identity.friendly_name
+                            device.model = identity.model
+                            device.claimed_manufacturer = identity.manufacturer
+                            device.identity_source = identity.source
+                            self.store.save_device(device)
+                            identified += 1
+                    self._dirty = True
+                    self._set_status(f'UPnP: сведения заявлены {identified} устройствами (не подтверждены)')
+                elif kind == 'identity_error':
+                    self.identity_busy = False
+                    self._set_status('UPnP: поиск недоступен или не поддерживается локальной сетью')
+                elif kind == "found":
                     d = item[1]
                     with self.state_lock:
                         old = self.devices.get(d.ip)
                         if old:
                             d.user_label = old.user_label
+                            if old.mac and d.mac and net.normalize_mac(old.mac) == net.normalize_mac(d.mac):
+                                for field in ('friendly_name', 'model', 'claimed_manufacturer', 'identity_source'):
+                                    setattr(d, field, getattr(old, field, ''))
                             if not d.mac:
                                 d.mac, d.vendor, d.vendor_source = old.mac, old.vendor, old.vendor_source
                         self.devices[d.ip] = d
@@ -2235,6 +2257,9 @@ class NetApp(tk.Tk):
                 previous = self.devices.get(device.ip)
                 if previous:
                     device.user_label = previous.user_label
+                    if previous.mac and device.mac and net.normalize_mac(previous.mac) == net.normalize_mac(device.mac):
+                        for field in ('friendly_name', 'model', 'claimed_manufacturer', 'identity_source'):
+                            setattr(device, field, getattr(previous, field, ''))
                 self.devices[device.ip] = device
             self.store.save_device(device)
         if not was_cancelled:
@@ -2407,7 +2432,8 @@ class NetApp(tk.Tk):
         self.device_table.delete(*self.device_table.get_children())
         for d in sorted(devices, key=lambda item: ipaddress.ip_address(item.ip)):
             self.device_table.insert("", "end", iid=d.ip,
-                values=(d.ip, d.user_label or d.hostname or "—", d.kind, d.mac or "—", d.vendor or "—",
+                values=(d.ip, d.user_label or d.friendly_name or d.hostname or "—", d.model or d.kind, d.mac or "—",
+                        (d.claimed_manufacturer + ' (UPnP*)' if d.claimed_manufacturer else d.vendor or "—"),
                         "Доступен" if d.online else "Нет ответа",
                         f"{d.latency_ms:.1f}" if d.latency_ms is not None else "—"),
                 tags=("up" if d.online else "down",))
@@ -2423,10 +2449,12 @@ class NetApp(tk.Tk):
         d = self.devices.get(ip)
         if d:
             self.selected_ip = ip
-            self.device_detail.configure(text=f"{ip} · {d.user_label or d.hostname or 'имя неизвестно'} · "
+            self.device_detail.configure(text=f"{ip} · {d.user_label or d.friendly_name or d.hostname or 'имя неизвестно'} · "
                 f"Имя из сети: {d.hostname or '—'} ({d.hostname_source or 'неизвестен'}) · "
                 f"MAC: {d.mac or '—'} · Производитель по OUI: {d.vendor or 'неизвестен'} · "
-                f"TCP-порты: {', '.join(map(str,d.ports)) or 'нет наблюдений'}")
+                f"TCP-порты: {', '.join(map(str,d.ports)) or 'нет наблюдений'} · "
+                f"UPnP модель: {d.model or '—'} · производитель: {d.claimed_manufacturer or '—'} "
+                '(заявлено устройством, не подтверждено)')
 
     def _device_double_click(self, _event=None):
         if self.selected_ip:
