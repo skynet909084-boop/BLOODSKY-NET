@@ -20,6 +20,7 @@ from . import __version__
 from . import network as net
 from . import wifi
 from . import wifi_radar
+from . import wifi_survey
 from . import topology
 from . import map_view
 from . import time_machine
@@ -207,10 +208,10 @@ class NetApp(tk.Tk):
         self._label(brand, "N E T W O R K  M O N I T O R", 8, color=MUTED).pack(anchor="w", pady=(2, 0))
         self._label(sidebar, "РАЗДЕЛЫ", 9, True, MUTED).pack(anchor="w", padx=22, pady=(35, 12))
         navigation = [("◫", "Обзор"), ("▤", "Устройства"), ("◇", "Карта сети"),
-                      ("◉", "Wi-Fi"), ("⇅", "Порты"), ("◷", "Машина времени"), ("⌕", "Детектив"), ("⌁", "Диагностика"), ("▣", "События")]
+                      ("◉", "Wi-Fi"), ("▦", "Покрытие Wi-Fi"), ("⇅", "Порты"), ("◷", "Машина времени"), ("⌕", "Детектив"), ("⌁", "Диагностика"), ("▣", "События")]
         for glyph, name in navigation:
             btn = tk.Button(sidebar, text=f"  {glyph}   {name}", relief="flat", borderwidth=0,
-                            anchor="w", padx=19, pady=13, font=("Segoe UI", 11),
+                            anchor="w", padx=19, pady=9, font=("Segoe UI", 11),
                             bg=SIDEBAR, fg=TEXT, activebackground=PANEL_ALT,
                             activeforeground=BLUE, cursor="hand2",
                             command=lambda n=name: self.show_page(n))
@@ -260,6 +261,7 @@ class NetApp(tk.Tk):
         self._page_devices()
         self._page_map()
         self._page_wifi()
+        self._page_wifi_survey()
         self._page_ports()
         self._page_time_machine()
         self._page_detective()
@@ -282,7 +284,7 @@ class NetApp(tk.Tk):
         self.pages[page].pack(fill="both", expand=True)
         self.current_page = page
         self.title_label.configure(text={"Обзор": "Обзор сети", "Устройства": "Обнаруженные устройства",
-                                         "Карта сети": "Карта локальной сети", "Wi-Fi": "Мониторинг Wi-Fi",
+                                         "Карта сети": "Карта локальной сети", "Wi-Fi": "Мониторинг Wi-Fi", "Покрытие Wi-Fi": "Wi-Fi RADAR · карта замеров",
                                          "Порты": "Трафик портов коммутаторов",
                                          "Машина времени": "NETWORK TIME MACHINE", "Детектив": "BLOODSKY DETECTIVE",
                                          "Диагностика": "Инструменты диагностики", "События": "Журнал событий"}[page])
@@ -290,6 +292,8 @@ class NetApp(tk.Tk):
             btn.configure(bg=PANEL_ALT if name == page else SIDEBAR,
                           fg=BLUE if name == page else TEXT)
         self._refresh_ui()
+        if page == 'Покрытие Wi-Fi':
+            self._wifi_survey_refresh()
         if page == 'Машина времени':
             self._timeline_refresh()
             self._lldp_timeline_refresh()
@@ -866,6 +870,118 @@ class NetApp(tk.Tk):
         self._label(parent, "* Диапазон по номеру канала определяется ориентировочно; часть номеров пересекается между 5 и 6 ГГц.",
                     9, color=MUTED).pack(anchor="w", pady=(9, 0))
 
+    def _page_wifi_survey(self):
+        parent = self._new_page('Покрытие Wi-Fi')
+        self._label(parent, 'WI-FI RADAR · РУЧНЫЕ ТОЧКИ ЗАМЕРОВ', 14, True, BLUE).pack(
+            anchor='w', pady=(0, 6))
+        self._label(parent, 'Назовите зону (например, Этаж 1), затем нажимайте на план-сетку там, где '
+                    'фактически находитесь. Сохраняются только текущие достоверные данные Windows WLAN. '
+                    'Координаты условные: это не GPS, не план здания и не радиоспектр.',
+                    9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', pady=(0, 10))
+        bar = tk.Frame(parent, bg=BG)
+        bar.pack(fill='x', pady=(0, 7))
+        self._label(bar, 'Зона:', 10, color=MUTED).pack(side='left')
+        self.survey_zone = tk.StringVar(value='Этаж 1')
+        entry = tk.Entry(bar, textvariable=self.survey_zone, bg=PANEL_ALT, fg=TEXT,
+                         insertbackground=TEXT, relief='flat', width=24, font=('Segoe UI', 11))
+        entry.pack(side='left', padx=(8, 12), ipady=6)
+        entry.bind('<Return>', lambda _e: self._wifi_survey_refresh())
+        self._button(bar, 'Показать зону', self._wifi_survey_refresh).pack(side='left')
+        self._button(bar, 'Экспорт CSV', self._wifi_survey_export).pack(side='right')
+        self.survey_note = self._label(parent, 'Для измерения подключитесь к Wi-Fi и обновите эфир на вкладке Wi-Fi.',
+                                       9, color=MUTED, wraplength=950, justify='left')
+        self.survey_note.pack(anchor='w', pady=(0, 7))
+        self.survey_canvas = tk.Canvas(parent, height=230, bg=PANEL, highlightthickness=0, cursor='crosshair')
+        self.survey_canvas.pack(fill='x', pady=(0, 9))
+        self.survey_canvas.bind('<Button-1>', self._wifi_survey_click)
+        self.survey_canvas.bind('<Configure>', lambda _e: self._wifi_survey_draw())
+        self._label(parent, 'СРЕДНИЕ ПО ЗОНАМ (WINDOWS %, НЕ dBm)', 10, True, BLUE).pack(anchor='w', pady=(4, 5))
+        frame, self.survey_stats = self._tree(parent,
+            ('Зона', 'Замеров', 'Средний', 'Минимум', 'Максимум', 'BSSID'), (200, 105, 130, 110, 115, 105))
+        frame.pack(fill='both', expand=True)
+        self.survey_stats.configure(height=5)
+        self._label(parent, 'Цвет точек: красный <45%, жёлтый 45–69%, зелёный ≥70%. '
+                    'Нет интерполяции между замерами; цвет не показывает скорость интернета. '
+                    'История не передаётся в облако, экспорт содержит SSID/BSSID.',
+                    9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', pady=(8, 0))
+
+    def _wifi_survey_click(self, event):
+        """Capture a manual location only from a fresh, measured connected WLAN."""
+        zone = self.survey_zone.get().strip()
+        state = self.wifi_report.status
+        measured = self.wifi_previously_observed and state.adapter and state.connected and not state.issue and (
+            0 <= time.monotonic()-self._wifi_observed_at <= 180)
+        if not measured:
+            self.survey_note.configure(text='Нет свежего подключённого WLAN-измерения. Обновите Wi-Fi и повторите.')
+            return
+        width, height = self.survey_canvas.winfo_width(), self.survey_canvas.winfo_height()
+        if width < 5 or height < 5:
+            return
+        try:
+            self.store.save_wifi_survey_point(
+                zone, max(0., min(100., event.x*100.0/width)),
+                max(0., min(100., event.y*100.0/height)),
+                state.ssid, state.bssid, state.signal, state.channel)
+        except (ValueError, sqlite3.Error) as exc:
+            self.survey_note.configure(text=f'Замер не сохранён: {str(exc)[:170]}')
+            return
+        self._wifi_survey_refresh()
+        self.survey_note.configure(text=f'Сохранён замер: {zone} · {state.ssid} · {state.signal}% · {state.bssid}')
+
+    def _wifi_survey_refresh(self):
+        try:
+            points = self.store.wifi_survey_points()
+        except sqlite3.Error:
+            self.survey_note.configure(text='Не удалось прочитать сохранённые замеры.')
+            return
+        self._survey_visible_points = tuple(p for p in points if p.zone == self.survey_zone.get().strip())
+        self.survey_stats.delete(*self.survey_stats.get_children())
+        for z in wifi_survey.zone_quality(points):
+            self.survey_stats.insert('', 'end', values=(z.zone, z.samples, f'{z.mean_signal:.1f}%',
+                                                      f'{z.min_signal}%', f'{z.max_signal}%', z.distinct_bssids))
+        self.survey_note.configure(text=f'Замеров в выбранной зоне: {len(self._survey_visible_points)} · '
+            f'всего: {len(points)}. Щёлкните на сетке для нового замера; текущий BSSID берётся из Windows.')
+        self._wifi_survey_draw()
+
+    def _wifi_survey_draw(self):
+        if not hasattr(self, 'survey_canvas'):
+            return
+        canvas = self.survey_canvas
+        canvas.delete('all')
+        w, h = max(1,canvas.winfo_width()), max(1,canvas.winfo_height())
+        for n in range(1,10):
+            x = w*n/10; y = h*n/10
+            canvas.create_line(x, 0, x, h, fill=BORDER)
+            canvas.create_line(0, y, w, y, fill=BORDER)
+        for p in getattr(self, '_survey_visible_points', ()):
+            x, y = p.x*w/100, p.y*h/100
+            canvas.create_oval(x-7,y-7,x+7,y+7,fill=wifi_survey.signal_color(p.signal),outline=TEXT,width=1)
+            canvas.create_text(x+10,y-9,anchor='w',text=f'{p.signal}%',fill=TEXT,font=('Segoe UI',9))
+        if not getattr(self, '_survey_visible_points', ()):
+            canvas.create_text(w/2,h/2,text='Точек пока нет · щёлкните, чтобы записать первый замер',
+                               fill=MUTED,font=('Segoe UI',11))
+
+    def _wifi_survey_export(self):
+        import csv
+        points = self.store.wifi_survey_points()
+        if not points:
+            messagebox.showinfo('Wi-Fi RADAR', 'Сохранённых замеров пока нет.', parent=self)
+            return
+        filename = filedialog.asksaveasfilename(title='Экспорт замеров (включает SSID и BSSID)',
+            defaultextension='.csv', filetypes=[('CSV','*.csv')], parent=self)
+        if not filename:
+            return
+        try:
+            with open(filename,'w',newline='',encoding='utf-8-sig') as fp:
+                writer=csv.writer(fp)
+                writer.writerow(('UTC','zone','x_percent','y_percent','SSID','BSSID','signal_windows_percent','channel'))
+                for p in points:
+                    writer.writerow((p.observed_at,wifi_survey.spreadsheet_safe(p.zone),p.x,p.y,
+                                     wifi_survey.spreadsheet_safe(p.ssid),p.bssid,p.signal,p.channel))
+            self._set_status(f'Wi-Fi RADAR: экспортировано {len(points)} точек')
+        except OSError:
+            messagebox.showerror('Wi-Fi RADAR', 'Не удалось сохранить CSV.', parent=self)
+
     def _page_tools(self):
         parent = self._new_page("Диагностика")
         control = self._panel(parent)
@@ -1439,7 +1555,8 @@ class NetApp(tk.Tk):
             'Пропущенные опросы не считаются отключением; % — не RSSI dBm.'))
         self.wifi_radar_table.delete(*self.wifi_radar_table.get_children())
         labels = {'roam': 'Переход BSSID', 'disconnect': 'Отключение',
-                  'network_change': 'Смена SSID', 'weak_signal': 'Слабый сигнал'}
+                  'network_change': 'Смена SSID', 'weak_signal': 'Слабый сигнал',
+                  'roam_bounce': 'Частый роуминг'}
         for item in reversed(result.events[-60:]):
             self.wifi_radar_table.insert('', 'end', values=(
                 item.at.isoformat(timespec='seconds'), labels.get(item.kind, item.kind), item.detail[:240]))

@@ -115,6 +115,23 @@ def analyze(samples: Sequence[WifiSample]) -> RadarSummary:
                 roams += 1
                 events.append(RadarEvent(current.observed_at, 'roam',
                                          f'{current.ssid}: BSSID {prev.bssid} → {current.bssid}'))
+    # A -> B -> A in the SAME SSID within <=180 seconds is a candidate ping-pong
+    # roaming event, not proof that the AP caused a disconnection.
+    last_bounce_at = None
+    for a, b, c in zip(ordered, ordered[1:], ordered[2:]):
+        if not (a.connected and b.connected and c.connected and
+                a.ssid and a.ssid == b.ssid == c.ssid and
+                a.bssid == c.bssid and a.bssid != b.bssid and
+                0 < (b.observed_at-a.observed_at).total_seconds() <= MAX_GAP_SECONDS and
+                0 < (c.observed_at-b.observed_at).total_seconds() <= MAX_GAP_SECONDS and
+                0 < (c.observed_at-a.observed_at).total_seconds() <= MAX_GAP_SECONDS):
+            continue
+        if last_bounce_at is not None and (c.observed_at-last_bounce_at).total_seconds() < 60:
+            continue  # Avoid repeated noise from overlapping triplets
+        events.append(RadarEvent(c.observed_at, 'roam_bounce',
+                                 f'Повторный переход BSSID за 180 с: {a.bssid} → {b.bssid} → {c.bssid}; '
+                                 'причина не подтверждена'))
+        last_bounce_at = c.observed_at
     # Distinct sustained low-signal periods (at least two measured points).
     streak = 0
     last: WifiSample | None = None
