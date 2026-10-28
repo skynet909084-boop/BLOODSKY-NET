@@ -63,6 +63,7 @@ class NetApp(tk.Tk):
         self.scan_stop = threading.Event()
         self.monitor_stop = threading.Event()
         self._wifi_busy = threading.Event()
+        self._wifi_lock = threading.Lock()
         self.scanning = False
         self.monitoring = False
         self.monitor_thread: threading.Thread | None = None
@@ -600,9 +601,10 @@ class NetApp(tk.Tk):
 
     def _read_wifi_background(self):
         """Allow at most one slow WLAN query at a time (no thread buildup)."""
-        if self._closed or self._wifi_busy.is_set():
-            return
-        self._wifi_busy.set()
+        with self._wifi_lock:
+            if self._closed or self._wifi_busy.is_set():
+                return
+            self._wifi_busy.set()
         def worker():
             try:
                 report = wifi.read_wifi()
