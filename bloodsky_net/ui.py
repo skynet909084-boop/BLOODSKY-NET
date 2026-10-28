@@ -15,7 +15,7 @@ import socket
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import __version__
 from . import network as net
@@ -148,6 +148,10 @@ class NetApp(tk.Tk):
         self._map_drag_state = None
         self._map_point_by_ip = {}
         self._map_center = (0, 0)
+        self._map_states = {}
+        self._map_full_window = None
+        self._map_full_canvas = None
+        self._map_full_detail = None
         self._dirty = False
         self._last_paint = 0.0
         self._closed = False
@@ -374,6 +378,29 @@ class NetApp(tk.Tk):
         detail.pack(fill="x", pady=(11, 0))
         self.device_detail = self._label(detail, "Выберите устройство для просмотра сведений.", 10, color=MUTED)
         self.device_detail.pack(anchor="w", padx=13, pady=13)
+        self._button(parent, "Задать понятное имя устройству", self._rename_device).pack(anchor="w", pady=(8, 0))
+
+    def _rename_device(self):
+        ip = self.selected_ip or self.map_selected_ip
+        dev = self.devices.get(ip)
+        if not dev:
+            messagebox.showinfo('Устройства','Сначала выберите устройство на карте или в списке.',parent=self)
+            return
+        label = simpledialog.askstring('Имя устройства',
+            f'{ip}: введите собственную подпись (пусто — сброс).\n'
+            'Это подпись пользователя, а не DNS-имя или модель устройства.',
+            initialvalue=dev.user_label,parent=self)
+        if label is None:
+            return
+        label = label.strip()
+        if len(label) > 64 or any(ord(c) < 32 or ord(c) == 127 for c in label):
+            messagebox.showerror('Имя устройства','До 64 печатных символов.',parent=self)
+            return
+        with self.state_lock:
+            dev.user_label = label
+        self.store.save_device(dev)
+        self._refresh_ui()
+        self._show_map_passport(ip)
 
     def _page_map(self):
         parent = self._new_page("Карта сети")
@@ -396,6 +423,7 @@ class NetApp(tk.Tk):
                              textvariable=self.map_group, width=14, style="Night.TCombobox")
         group.pack(side="left", padx=(8, 0))
         group.bind("<<ComboboxSelected>>", lambda _event: self._draw_map())
+        self._button(top, "На весь экран  ⛶", self._open_fullscreen_map, primary=True).pack(side="right", padx=(7, 0))
         self._button(top, "Сбросить позиции", self._reset_map_positions).pack(side="right", padx=(7, 0))
         self._button(top, "Сохранить карту SVG", self.export_map).pack(side="right", padx=(8, 0))
         self._button(top, "Опрос SNMP/LLDP", self._snmp_dialog, primary=True).pack(side="right")
@@ -2038,8 +2066,10 @@ class NetApp(tk.Tk):
                     d = item[1]
                     with self.state_lock:
                         old = self.devices.get(d.ip)
-                        if old and not d.mac:
-                            d.mac, d.vendor = old.mac, old.vendor
+                        if old:
+                            d.user_label = old.user_label
+                            if not d.mac:
+                                d.mac, d.vendor, d.vendor_source = old.mac, old.vendor, old.vendor_source
                         self.devices[d.ip] = d
                     if not old:
                         self._event("info", "Новое устройство", f"{d.ip}  {d.hostname}  {d.kind}")
@@ -2187,6 +2217,9 @@ class NetApp(tk.Tk):
         for device in devices:
             # The final snapshot contains the newest MAC information.
             with self.state_lock:
+                previous = self.devices.get(device.ip)
+                if previous:
+                    device.user_label = previous.user_label
                 self.devices[device.ip] = device
             self.store.save_device(device)
         if not was_cancelled:
@@ -2223,6 +2256,7 @@ class NetApp(tk.Tk):
                     device = self.devices[ip]
                     device.mac = mac
                     device.vendor = net.mac_vendor(mac)
+                    device.vendor_source = 'OUI (владелец MAC-блока)' if not net.is_private_mac(mac) else ''
         self._dirty = True
 
     def _update_monitor(self, samples, neighbors):
@@ -2358,7 +2392,7 @@ class NetApp(tk.Tk):
         self.device_table.delete(*self.device_table.get_children())
         for d in sorted(devices, key=lambda item: ipaddress.ip_address(item.ip)):
             self.device_table.insert("", "end", iid=d.ip,
-                values=(d.ip, d.hostname or "—", d.kind, d.mac or "—", d.vendor or "—",
+                values=(d.ip, d.user_label or d.hostname or "—", d.kind, d.mac or "—", d.vendor or "—",
                         "Доступен" if d.online else "Нет ответа",
                         f"{d.latency_ms:.1f}" if d.latency_ms is not None else "—"),
                 tags=("up" if d.online else "down",))
@@ -2374,7 +2408,10 @@ class NetApp(tk.Tk):
         d = self.devices.get(ip)
         if d:
             self.selected_ip = ip
-            self.device_detail.configure(text=f"{ip}  ·  {d.hostname or 'имя неизвестно'}  ·  порты: {', '.join(map(str, d.ports)) or 'нет подтверждённых'}  ·  последний ответ: {d.seen or '—'}")
+            self.device_detail.configure(text=f"{ip} · {d.user_label or d.hostname or 'имя неизвестно'} · "
+                f"Имя из сети: {d.hostname or '—'} ({d.hostname_source or 'неизвестен'}) · "
+                f"MAC: {d.mac or '—'} · Производитель по OUI: {d.vendor or 'неизвестен'} · "
+                f"TCP-порты: {', '.join(map(str,d.ports)) or 'нет наблюдений'}")
 
     def _device_double_click(self, _event=None):
         if self.selected_ip:
@@ -2454,6 +2491,63 @@ class NetApp(tk.Tk):
         self._draw_curve(self.latency_canvas, list(self.latency_history), GREEN)
         self._draw_curve(self.signal_canvas, list(self.signal_history), BLUE, 100)
 
+
+    def _open_fullscreen_map(self):
+        """Independent full-screen map window with scroll, labels and drag."""
+        if self._map_full_window and self._map_full_window.winfo_exists():
+            self._map_full_window.lift()
+            self._map_full_window.focus_force()
+            return
+        win = tk.Toplevel(self)
+        self._map_full_window = win
+        win.title('BLOODSKY NET · Карта сети на весь экран')
+        win.configure(bg=BG)
+        win.attributes('-fullscreen', True)
+        bar = tk.Frame(win,bg=SIDEBAR)
+        bar.pack(fill='x',padx=8,pady=6)
+        self._label(bar,'BLOODSKY NET · LIVE MAP',13,True,BLUE).pack(side='left',padx=10)
+        self._label(bar,'Esc / F11 — выход · колесо — прокрутка · узлы можно перемещать',
+                    9,color=MUTED).pack(side='left',padx=10)
+        zoom = ttk.Combobox(bar,state='readonly',textvariable=self.map_zoom,
+                            values=('75%','100%','125%','150%','200%'),width=5,
+                            style='Night.TCombobox')
+        zoom.pack(side='right',padx=(4,12))
+        zoom.bind('<<ComboboxSelected>>',lambda event:self._draw_map())
+        self._button(bar,'Закрыть полный экран  Esc',self._close_fullscreen_map).pack(side='right')
+        self._button(bar,'Назвать устройство',self._rename_device).pack(side='right',padx=8)
+        shell = tk.Frame(win,bg=PANEL)
+        shell.pack(fill='both',expand=True,padx=8)
+        canvas = tk.Canvas(shell,bg=PANEL,highlightthickness=0)
+        self._map_full_canvas = canvas
+        vertical = tk.Scrollbar(shell,orient='vertical',command=canvas.yview)
+        horizontal = tk.Scrollbar(shell,orient='horizontal',command=canvas.xview)
+        canvas.configure(yscrollcommand=vertical.set,xscrollcommand=horizontal.set)
+        vertical.pack(side='right',fill='y')
+        horizontal.pack(side='bottom',fill='x')
+        canvas.pack(side='left',fill='both',expand=True)
+        canvas.bind('<Configure>',lambda event:self._draw_map(canvas=canvas))
+        canvas.bind('<MouseWheel>',lambda event:canvas.yview_scroll(-int(event.delta/120),'units'))
+        self._map_full_detail = self._label(win,
+            'Выберите устройство для просмотра данных. Пунктир — схема, а не кабель.',
+            10,color=TEXT,justify='left',wraplength=1250)
+        self._map_full_detail.pack(anchor='w',padx=18,pady=8)
+        win.bind('<Escape>',lambda event:self._close_fullscreen_map())
+        win.bind('<F11>',lambda event:self._close_fullscreen_map())
+        win.protocol('WM_DELETE_WINDOW',self._close_fullscreen_map)
+        win.focus_force()
+        self._draw_map(canvas=canvas)
+
+    def _close_fullscreen_map(self):
+        canvas = self._map_full_canvas
+        self._map_full_canvas = None
+        self._map_full_detail = None
+        win = self._map_full_window
+        self._map_full_window = None
+        if canvas is not None:
+            self._map_states.pop(canvas,None)
+        if win and win.winfo_exists():
+            win.destroy()
+
     def _map_selection(self, devices=None):
         if devices is None:
             with self.state_lock:
@@ -2466,11 +2560,18 @@ class NetApp(tk.Tk):
         return map_view.layout_positions(devices, zoom, self.map_group.get(),
                                          self.map_manual_positions)
 
-    def _draw_map(self, devices=None):
-        if not hasattr(self, "map_canvas"):
+    def _draw_map(self, devices=None, canvas=None):
+        if not hasattr(self, 'map_canvas'):
             return
+        if canvas is None:
+            self._render_map(self.map_canvas,devices)
+            if self._map_full_canvas is not None and self._map_full_canvas.winfo_exists():
+                self._render_map(self._map_full_canvas,devices)
+        else:
+            self._render_map(canvas,devices)
+
+    def _render_map(self, canvas, devices=None):
         view = self._map_selection(devices)
-        canvas = self.map_canvas
         canvas.delete("all")
         width, height = max(canvas.winfo_width(), 880), max(canvas.winfo_height(), 590)
         center_x, center_y = width // 2, max(280, height // 2)
@@ -2504,6 +2605,7 @@ class NetApp(tk.Tk):
                                dash=(4, 4))  # illustrative scheme, not a physical cable
         point_by_ip = {dev.ip: (center_x+dx, center_y+dy) for dev, dx, dy in positions}
         self._map_point_by_ip = point_by_ip
+        self._map_states[canvas] = ((center_x, center_y),point_by_ip)
         for source, target, neighbor in observed:
             if source not in point_by_ip or target not in point_by_ip:
                 continue
@@ -2522,7 +2624,7 @@ class NetApp(tk.Tk):
                                fill=color, outline=outline, width=3, tags=(key, "node"))
             canvas.create_text(x, y+23, text=dev.ip, fill=TEXT,
                                font=("Consolas", 10), tags=(key, "node"))
-            canvas.create_text(x, y+38, text=(dev.hostname or dev.kind)[:24], fill=MUTED,
+            canvas.create_text(x, y+38, text=(dev.user_label or dev.hostname or dev.kind)[:32], fill=MUTED,
                                font=("Segoe UI", 9), tags=(key, "node"))
             evidence = fdb_rows.get(dev.ip, ())
             if evidence:
@@ -2548,34 +2650,41 @@ class NetApp(tk.Tk):
             self._show_map_passport(self.map_selected_ip, view.devices, observed, fdb_rows)
 
     def _map_drag_begin(self, event, ip):
-        self._map_drag_state = (ip, event.x, event.y, event.x, event.y)
+        canvas = event.widget
+        x, y = canvas.canvasx(event.x), canvas.canvasy(event.y)
+        self._map_drag_state = (ip,canvas,x,y,x,y)
 
     def _map_drag_move(self, event, ip):
         state = self._map_drag_state
-        if not state or state[0] != ip:
+        canvas = event.widget
+        if not state or state[0] != ip or state[1] is not canvas:
             return
-        _, x0, y0, last_x, last_y = state
-        self.map_canvas.move(f"host:{ip}", event.x-last_x, event.y-last_y)
-        self._map_drag_state = (ip, x0, y0, event.x, event.y)
+        _, _, x0, y0, last_x, last_y = state
+        x, y = canvas.canvasx(event.x), canvas.canvasy(event.y)
+        canvas.move(f'host:{ip}',x-last_x,y-last_y)
+        self._map_drag_state = (ip,canvas,x0,y0,x,y)
 
     def _map_drag_end(self, event, ip):
         state = self._map_drag_state
         self._map_drag_state = None
-        if not state or state[0] != ip:
+        canvas = event.widget
+        if not state or state[0] != ip or state[1] is not canvas:
             return
-        _, x0, y0, _, _ = state
-        dx, dy = event.x-x0, event.y-y0
-        if abs(dx) + abs(dy) < 5:
+        _, _, x0, y0, _, _ = state
+        xend,yend = canvas.canvasx(event.x),canvas.canvasy(event.y)
+        dx,dy=xend-x0,yend-y0
+        if abs(dx)+abs(dy)<5:
             self._map_pick(ip)
             return
-        if ip not in self._map_point_by_ip:
+        center,positions=self._map_states.get(canvas,((0,0),{}))
+        if ip not in positions:
             return
-        px, py = self._map_point_by_ip[ip]
-        zoom = int(self.map_zoom.get().rstrip("%")) / 100.0
-        x, y = (px+dx-self._map_center[0])/zoom, (py+dy-self._map_center[1])/zoom
-        if map_view.valid_position(x, y):
-            self.store.save_map_position(ip, x, y)
-            self.map_manual_positions[ip] = (x, y)
+        px,py=positions[ip]
+        zoom=int(self.map_zoom.get().rstrip('%'))/100.0
+        x,y=(px+dx-center[0])/zoom,(py+dy-center[1])/zoom
+        if map_view.valid_position(x,y):
+            self.store.save_map_position(ip,x,y)
+            self.map_manual_positions[ip]=(x,y)
         self._draw_map()
 
     def _reset_map_positions(self):
@@ -2584,20 +2693,27 @@ class NetApp(tk.Tk):
         self._draw_map()
 
     def _show_map_passport(self, ip, devices=None, observed=None, fdb_rows=None):
-        if not hasattr(self, 'map_device_detail'):
+        if not hasattr(self, 'map_device_detail') and self._map_full_detail is None:
             return
         if devices is None:
             with self.state_lock:
                 devices = list(self.devices.values())
         device = next((d for d in devices if d.ip == ip), None)
         if not device:
-            self.map_device_detail.configure(text="Выберите обнаруженное устройство")
+            if hasattr(self,'map_device_detail'):
+                self.map_device_detail.configure(text='Выберите обнаруженное устройство')
+            if self._map_full_detail is not None:
+                self._map_full_detail.configure(text='Выберите обнаруженное устройство')
             return
         fresh = self._fresh_topology()
         observed = observed if observed is not None else map_view.lldp_edges(fresh, devices)
         fdb_rows = fdb_rows if fdb_rows is not None else map_view.learned_ports(fresh, devices)
         links = [n for source, target, n in observed if ip in (source, target)]
-        self.map_device_detail.configure(text=map_view.passport(device, fdb_rows.get(ip, ()), links))
+        passport = map_view.passport(device,fdb_rows.get(ip,()),links)
+        if hasattr(self,'map_device_detail'):
+            self.map_device_detail.configure(text=passport)
+        if self._map_full_detail is not None:
+            self._map_full_detail.configure(text=passport)
 
     def _paint_neighbors(self, devices):
         self.neighbor_table.delete(*self.neighbor_table.get_children())
@@ -2937,7 +3053,7 @@ class NetApp(tk.Tk):
         for d, dx, dy in positions:
             x, y = center+dx, center+dy
             color = YELLOW if d.ip in self.ip_alerts else (GREEN if d.online else RED)
-            label = escape((d.hostname or d.kind)[:28])
+            label = escape((d.user_label or d.hostname or d.kind)[:28])
             parts.extend([f'<circle cx="{x:.1f}" cy="{y:.1f}" r="12" fill="{color}"/>',
                           f'<text x="{x:.1f}" y="{y+30:.1f}" text-anchor="middle" fill="{TEXT}" font-family="Consolas,monospace" font-size="13">{escape(d.ip)}</text>',
                           f'<text x="{x:.1f}" y="{y+47:.1f}" text-anchor="middle" fill="{MUTED}" font-family="Segoe UI,sans-serif" font-size="11">{label}</text>'])

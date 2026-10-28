@@ -12,7 +12,7 @@ from typing import Sequence
 
 
 STATUS_OPTIONS = ("Все", "В сети", "Нет связи", "IP-подозрение")
-MAX_MAP_NODES = 120
+MAX_MAP_NODES = 512
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ def select_devices(devices: Sequence, query: str = "", status: str = "Все",
         if status == "IP-подозрение" and device.ip not in alerts:
             continue
         if needle and not any(needle in str(getattr(device, key, '') or '').casefold()
-                              for key in ('ip', 'mac', 'hostname', 'vendor', 'kind')):
+                              for key in ('ip', 'mac', 'hostname', 'user_label', 'vendor', 'kind')):
             continue
         filtered.append(device)
     # Numeric IPv4 ordering; deterministic even when discovery order differs.
@@ -179,9 +179,10 @@ def learned_ports(snapshots, devices: Sequence):
 def passport(device, learned=(), links=()):
     """Human-readable device details with explicitly labelled evidence."""
     state = 'В сети (текущий опрос)' if device.online else 'Не отвечает / последнее известное устройство'
-    pieces = [f'{device.ip} · {device.hostname or device.kind}',
+    pieces = [f'{device.ip} · {device.user_label or device.hostname or device.kind}',
               f'Состояние: {state} · MAC: {device.mac or "неизвестен"} · Производитель: {device.vendor or "не определён"}',
-              f'Тип: {device.kind} · последний ответ: {device.seen or "неизвестен"} · Ping: {f"{device.latency_ms:.1f} мс" if device.latency_ms is not None else "нет измерения"}']
+              f'Имя из сети: {device.hostname or "не определено"} · источник: {device.hostname_source or "неизвестен"} · производитель по OUI (не модель)',
+              f'Тип (по косвенным признакам): {device.kind} · последний ответ: {device.seen or "неизвестен"} · Ping: {f"{device.latency_ms:.1f} мс" if device.latency_ms is not None else "нет измерения"}']
     if links:
         ports = [f'{n.local_port} ↔ {n.remote_port or "?"}' for n in links[:3]]
         pieces.append('LLDP-наблюдения портов: ' + '; '.join(ports))

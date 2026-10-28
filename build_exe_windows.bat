@@ -9,7 +9,7 @@ if not exist ".venv\Scripts\python.exe" (
 if errorlevel 1 exit /b 1
 ".venv\Scripts\python.exe" tools\build_branding.py
 if errorlevel 1 exit /b 1
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all pysnmp --collect-all Cryptodome --collect-all pystray --collect-all PIL --collect-all cryptography --icon assets/BLOODSKY-NET.ico --name BLOODSKY-NET app.py
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all pysnmp --collect-all Cryptodome --collect-all pystray --collect-all PIL --collect-all cryptography --collect-all pymanuf --icon assets/BLOODSKY-NET.ico --name BLOODSKY-NET app.py
 if errorlevel 1 (
   echo Ошибка сборки
   pause

@@ -31,7 +31,7 @@ jobs:
           python tools/probe_stability_soak.py
           python tools/probe_security_soak.py
       - name: Build portable EXE
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all pysnmp --collect-all Cryptodome --collect-all pystray --collect-all PIL --collect-all cryptography --icon assets/BLOODSKY-NET.ico --name BLOODSKY-NET app.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all pysnmp --collect-all Cryptodome --collect-all pystray --collect-all PIL --collect-all cryptography --collect-all pymanuf --icon assets/BLOODSKY-NET.ico --name BLOODSKY-NET app.py
       - name: Verify embedded BLOODSKY EXE icon
         shell: pwsh
         run: |
