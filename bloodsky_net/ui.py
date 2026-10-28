@@ -41,6 +41,8 @@ from . import topology_incidents
 from . import port_health
 from . import fdb
 from . import traffic
+from . import device_identity
+from . import device_traffic
 from . import notifications
 from . import dhcp
 from . import windows_integration
@@ -77,6 +79,7 @@ class NetApp(tk.Tk):
         self.topology_received: dict[str, float] = {}
         self.topology_failed: set[str] = set()
         self.port_rates: dict[str, dict[int, traffic.PortRate]] = {}
+        self.identity_busy = False
         self.port_error_deltas: dict[str, tuple[port_health.ErrorDelta, ...]] = {}
         self.selected_port: tuple[str, int] | None = None
         self.snmp_auto_enabled = False
@@ -342,19 +345,29 @@ class NetApp(tk.Tk):
         self.traffic_label = self._label(detail, "Трафик адаптера: измерение…", 10, color=MUTED)
         self.traffic_label.pack(anchor="w", padx=15, pady=(0, 13))
         charts = tk.Frame(parent, bg=BG)
-        charts.pack(fill="both", expand=True)
+        charts.pack(fill="x", pady=(0, 10))
         a = self._panel(charts)
         a.pack(side="left", fill="both", expand=True, padx=(0, 9))
         self._label(a, "ЗАДЕРЖКА ДО ШЛЮЗА  ·  ms", 10, True, TEXT).pack(anchor="w", padx=16, pady=(14, 8))
-        self.latency_canvas = tk.Canvas(a, bg=PANEL, highlightthickness=0, height=220)
+        self.latency_canvas = tk.Canvas(a, bg=PANEL, highlightthickness=0, height=128)
         self.latency_canvas.pack(fill="both", expand=True, padx=11, pady=(0, 10))
         self.latency_canvas.bind("<Configure>", lambda e: self._draw_charts())
         b = self._panel(charts)
         b.pack(side="left", fill="both", expand=True, padx=(9, 0))
         self._label(b, "УРОВЕНЬ WI-FI  ·  %", 10, True, TEXT).pack(anchor="w", padx=16, pady=(14, 8))
-        self.signal_canvas = tk.Canvas(b, bg=PANEL, highlightthickness=0, height=220)
+        self.signal_canvas = tk.Canvas(b, bg=PANEL, highlightthickness=0, height=128)
         self.signal_canvas.pack(fill="both", expand=True, padx=11, pady=(0, 10))
         self.signal_canvas.bind("<Configure>", lambda e: self._draw_charts())
+        usage_panel = self._panel(parent)
+        usage_panel.pack(fill='both', expand=True)
+        self._label(usage_panel, 'КТО ИСПОЛЬЗУЕТ ТРАФИК · SNMP', 10, True, TEXT).pack(
+            anchor='w', padx=12, pady=(14, 4))
+        self.usage_canvas = tk.Canvas(usage_panel, bg=PANEL, highlightthickness=0, height=142)
+        self.usage_canvas.pack(fill='both', expand=True, padx=8)
+        self.usage_canvas.bind('<Configure>', lambda _e: self._draw_consumption())
+        self.usage_note = self._label(usage_panel, 'Нужны два SNMP-опроса и FDB коммутатора.',
+                                      8, color=MUTED, wraplength=600, justify='left')
+        self.usage_note.pack(anchor='w', padx=10, pady=(1, 11))
         self._label(parent, "Карта отображает логические связи обнаруженных устройств. Физические порты и кабели без SNMP/LLDP неизвестны.",
                     9, color=MUTED).pack(anchor="w", pady=(12, 0))
 
@@ -366,8 +379,9 @@ class NetApp(tk.Tk):
         self.devices_count.pack(side="left")
         self._button(toolbar, "Экспорт CSV", self.export_csv).pack(side="right", padx=(6, 0))
         self._button(toolbar, "Отчёт JSON", self.export_json).pack(side="right", padx=(6, 0))
+        self._button(toolbar, 'Уточнить модели · UPnP', self._discover_models).pack(side='right', padx=(6, 0))
         frame, self.device_table = self._tree(parent,
-            ("IP-адрес", "Имя устройства", "Тип", "MAC", "Производитель", "Состояние", "Ping, мс"),
+            ("IP-адрес", "Имя устройства", "Модель / тип", "MAC", "Производитель", "Состояние", "Ping, мс"),
             (122, 160, 225, 141, 151, 109, 92))
         frame.pack(fill="both", expand=True)
         self.device_table.tag_configure("up", foreground=GREEN)
@@ -424,6 +438,7 @@ class NetApp(tk.Tk):
         group.pack(side="left", padx=(8, 0))
         group.bind("<<ComboboxSelected>>", lambda _event: self._draw_map())
         self._button(top, "На весь экран  ⛶", self._open_fullscreen_map, primary=True).pack(side="right", padx=(7, 0))
+        self._button(top, 'Уточнить модели', self._discover_models).pack(side='right', padx=(7, 0))
         self._button(top, "Сбросить позиции", self._reset_map_positions).pack(side="right", padx=(7, 0))
         self._button(top, "Сохранить карту SVG", self.export_map).pack(side="right", padx=(8, 0))
         self._button(top, "Опрос SNMP/LLDP", self._snmp_dialog, primary=True).pack(side="right")
@@ -2062,12 +2077,34 @@ class NetApp(tk.Tk):
                 item = self.messages.get_nowait()
                 count += 1
                 kind = item[0]
-                if kind == "found":
+                if kind == 'identity_results':
+                    self.identity_busy = False
+                    identified = 0
+                    with self.state_lock:
+                        for ip, identity in item[1].items():
+                            device = self.devices.get(ip)
+                            if device is None:
+                                continue
+                            device.friendly_name = identity.friendly_name
+                            device.model = identity.model
+                            device.claimed_manufacturer = identity.manufacturer
+                            device.identity_source = identity.source
+                            self.store.save_device(device)
+                            identified += 1
+                    self._dirty = True
+                    self._set_status(f'UPnP: сведения заявлены {identified} устройствами (не подтверждены)')
+                elif kind == 'identity_error':
+                    self.identity_busy = False
+                    self._set_status('UPnP: поиск недоступен или не поддерживается локальной сетью')
+                elif kind == "found":
                     d = item[1]
                     with self.state_lock:
                         old = self.devices.get(d.ip)
                         if old:
                             d.user_label = old.user_label
+                            if old.mac and d.mac and net.normalize_mac(old.mac) == net.normalize_mac(d.mac):
+                                for field in ('friendly_name', 'model', 'claimed_manufacturer', 'identity_source'):
+                                    setattr(d, field, getattr(old, field, ''))
                             if not d.mac:
                                 d.mac, d.vendor, d.vendor_source = old.mac, old.vendor, old.vendor_source
                         self.devices[d.ip] = d
@@ -2220,6 +2257,9 @@ class NetApp(tk.Tk):
                 previous = self.devices.get(device.ip)
                 if previous:
                     device.user_label = previous.user_label
+                    if previous.mac and device.mac and net.normalize_mac(previous.mac) == net.normalize_mac(device.mac):
+                        for field in ('friendly_name', 'model', 'claimed_manufacturer', 'identity_source'):
+                            setattr(device, field, getattr(previous, field, ''))
                 self.devices[device.ip] = device
             self.store.save_device(device)
         if not was_cancelled:
@@ -2392,7 +2432,8 @@ class NetApp(tk.Tk):
         self.device_table.delete(*self.device_table.get_children())
         for d in sorted(devices, key=lambda item: ipaddress.ip_address(item.ip)):
             self.device_table.insert("", "end", iid=d.ip,
-                values=(d.ip, d.user_label or d.hostname or "—", d.kind, d.mac or "—", d.vendor or "—",
+                values=(d.ip, d.user_label or d.friendly_name or d.hostname or "—", d.model or d.kind, d.mac or "—",
+                        (d.claimed_manufacturer + ' (UPnP*)' if d.claimed_manufacturer else d.vendor or "—"),
                         "Доступен" if d.online else "Нет ответа",
                         f"{d.latency_ms:.1f}" if d.latency_ms is not None else "—"),
                 tags=("up" if d.online else "down",))
@@ -2408,10 +2449,12 @@ class NetApp(tk.Tk):
         d = self.devices.get(ip)
         if d:
             self.selected_ip = ip
-            self.device_detail.configure(text=f"{ip} · {d.user_label or d.hostname or 'имя неизвестно'} · "
+            self.device_detail.configure(text=f"{ip} · {d.user_label or d.friendly_name or d.hostname or 'имя неизвестно'} · "
                 f"Имя из сети: {d.hostname or '—'} ({d.hostname_source or 'неизвестен'}) · "
                 f"MAC: {d.mac or '—'} · Производитель по OUI: {d.vendor or 'неизвестен'} · "
-                f"TCP-порты: {', '.join(map(str,d.ports)) or 'нет наблюдений'}")
+                f"TCP-порты: {', '.join(map(str,d.ports)) or 'нет наблюдений'} · "
+                f"UPnP модель: {d.model or '—'} · производитель: {d.claimed_manufacturer or '—'} "
+                '(заявлено устройством, не подтверждено)')
 
     def _device_double_click(self, _event=None):
         if self.selected_ip:
@@ -2490,6 +2533,87 @@ class NetApp(tk.Tk):
     def _draw_charts(self):
         self._draw_curve(self.latency_canvas, list(self.latency_history), GREEN)
         self._draw_curve(self.signal_canvas, list(self.signal_history), BLUE, 100)
+        self._draw_consumption()
+
+    def _draw_consumption(self):
+        """Only measured SNMP/FDB port shares, never claim full LAN visibility."""
+        if not hasattr(self, 'usage_canvas'):
+            return
+        canvas = self.usage_canvas
+        canvas.delete('all')
+        width = max(230, canvas.winfo_width())
+        height = max(140, canvas.winfo_height())
+        palette = ('#4ABEF1', '#4CD4A5', '#FFBD60', '#FF6D7D', '#9D8DFF', '#55C0BD')
+        with self.state_lock:
+            devices = tuple(self.devices.values())
+        fresh = self._fresh_topology()
+        usage = device_traffic.measured_usage(devices, fresh, self.port_rates)
+        total = sum(u.mbps for u in usage)
+        cx, cy, radius = 77, max(68, min(height // 2, height - 40)), 43
+        canvas.create_oval(cx-radius, cy-radius, cx+radius, cy+radius,
+                           outline=PANEL_ALT, width=20)
+        if total > 0:
+            angle = 90.0
+            for i, item in enumerate(usage):
+                if item.mbps <= 0:
+                    continue
+                length = 360.0 * item.mbps / total
+                if length >= 359.95:
+                    canvas.create_oval(cx-radius, cy-radius, cx+radius, cy+radius,
+                                       outline=palette[i % len(palette)], width=20)
+                else:
+                    canvas.create_arc(cx-radius, cy-radius, cx+radius, cy+radius,
+                                      start=angle-length, extent=length,
+                                      style='arc', outline=palette[i % len(palette)], width=20)
+                angle -= length
+        canvas.create_text(cx, cy-7, text=f'{total:.2f}', fill=TEXT,
+                           font=('Segoe UI Semibold', 13))
+        canvas.create_text(cx, cy+12, text='Мбит/с*', fill=MUTED,
+                           font=('Segoe UI', 9))
+        if usage:
+            for n, item in enumerate(usage[:8]):
+                x = 160 + (n // 4) * max(230, (width-175)//2)
+                y = 22 + (n % 4)*33
+                canvas.create_oval(x, y+4, x+9, y+13, fill=palette[n % len(palette)], outline='')
+                name = item.label if len(item.label) <= 19 else item.label[:18] + '…'
+                canvas.create_text(x+15, y, text=name, anchor='nw', fill=TEXT,
+                                   font=('Segoe UI', 9))
+                canvas.create_text(x+15, y+15,
+                    text=(f'↓{item.download_mbps:.1f} ↑{item.upload_mbps:.1f} Мбит/с · {100*item.mbps/total:.0f}%'
+                          if total else '0 Мбит/с'), anchor='nw', fill=MUTED, font=('Segoe UI', 8))
+            self.usage_note.configure(text=(
+                f'* {len(usage)} однозначных портов (показано {min(8,len(usage))}), текущий SNMP. '
+                '↓/↑ и детали — режим «Специалист» → «Порты». Не весь трафик LAN.'))
+        else:
+            canvas.create_text(width-8, cy, anchor='e', text='Нет данных по устройствам',
+                               fill=MUTED, font=('Segoe UI', 9))
+            self.usage_note.configure(text='Включите SNMP-автоопрос коммутатора; нужны два замера и FDB. '
+                                      'Без доступа к портам трафик соседей не измерить.')
+
+    def _discover_models(self):
+        """User-initiated SSDP, off the Tk thread, no auto-network discovery."""
+        if self.identity_busy or self.scanning:
+            return
+        with self.state_lock:
+            count = len(self.devices)
+        if not count:
+            messagebox.showinfo('Распознавание устройств', 'Сначала просканируйте сеть.', parent=self)
+            return
+        if not messagebox.askyesno('Уточнить модели устройств',
+            'Отправить один локальный UPnP/SSDP запрос в выбранную подсеть? '
+            'Устройства могут сообщить модель и производителя, но эти сведения не проверены.',
+            parent=self):
+            return
+        self.identity_busy = True
+        subnet = self.network_value.get().strip()
+        def worker():
+            try:
+                result = device_identity.discover(subnet)
+                self.messages.put(('identity_results', result))
+            except (OSError, ValueError):
+                self.messages.put(('identity_error',))
+        threading.Thread(target=worker, daemon=True, name='BloodskyUPnP').start()
+        self._set_status('UPnP: запрашиваем имена и модели в локальной сети…')
 
 
     def _open_fullscreen_map(self):

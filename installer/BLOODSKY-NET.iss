@@ -1,5 +1,5 @@
 #define MyAppName "BLOODSKY NET"
-#define MyAppVersion "0.36.0-dev"
+#define MyAppVersion "0.37.0-dev"
 #define MyAppExeName "BLOODSKY-NET.exe"
 
 [Setup]
