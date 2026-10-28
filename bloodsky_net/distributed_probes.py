@@ -78,6 +78,10 @@ def create_snapshot(label: str, observations: Sequence[tuple[str, str, datetime]
     seen: set[str] = set()
     rows = []
     for ip, state, stamp in observations:
+        # ipaddress accepts integers/bools; untrusted JSON must supply a
+        # textual dotted-quad address instead of coercible arbitrary types.
+        if type(ip) is not str or not 7 <= len(ip) <= 15:
+            raise ValueError('IP-адрес должен быть строкой IPv4')
         ip = str(ipaddress.IPv4Address(ip))
         if ip in seen or state not in STATES or not isinstance(stamp, datetime) or stamp.tzinfo is None:
             raise ValueError('Дублирующееся, неизвестное или недатированное ICMP-измерение')
