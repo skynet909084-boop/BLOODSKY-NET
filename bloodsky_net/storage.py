@@ -42,6 +42,7 @@ class Storage:
                 inbound_mbps REAL NOT NULL,
                 outbound_mbps REAL NOT NULL)""")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_port_traffic_device ON port_traffic(switch_ip, if_index, id)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS map_positions (ip TEXT PRIMARY KEY, x REAL NOT NULL, y REAL NOT NULL)")
         self.db.commit()
         self._wifi_writes = 0
         self._port_writes = 0
@@ -170,6 +171,32 @@ class Storage:
             "WHERE switch_ip = ? AND if_index = ? ORDER BY id DESC LIMIT ?",
             (switch_ip, if_index, length)).fetchall()
         return list(reversed(rows))
+
+    def map_positions(self) -> dict[str, tuple[float, float]]:
+        """Only user-arranged map coordinates; never credentials or inferred links."""
+        from .map_view import valid_position
+        result = {}
+        for ip, x, y in self.db.execute("SELECT ip, x, y FROM map_positions"):
+            try:
+                ipaddress.IPv4Address(ip)
+                if valid_position(x, y):
+                    result[ip] = (x, y)
+            except ValueError:
+                continue
+        return result
+
+    def save_map_position(self, ip: str, x: float, y: float):
+        from .map_view import valid_position
+        ipaddress.IPv4Address(ip)
+        if not valid_position(x, y):
+            raise ValueError("Invalid map position")
+        self.db.execute("INSERT INTO map_positions(ip,x,y) VALUES(?,?,?) "
+                        "ON CONFLICT(ip) DO UPDATE SET x=excluded.x, y=excluded.y", (ip, float(x), float(y)))
+        self.db.commit()
+
+    def clear_map_positions(self):
+        self.db.execute("DELETE FROM map_positions")
+        self.db.commit()
 
     def close(self):
         self.db.close()
