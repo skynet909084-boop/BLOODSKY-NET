@@ -90,3 +90,23 @@ def percent_to_canvas(x: float, y: float, bounds: tuple[float, float, float, flo
     if not all(isfinite(v) for v in (x, y, left, top, width, height)) or not (0 <= x <= 100 and 0 <= y <= 100):
         raise ValueError('Недопустимые координаты точки')
     return left + width*x/100, top + height*y/100
+
+
+def zoomed_bounds(canvas_width: int, canvas_height: int, image_width: int,
+                  image_height: int, zoom: int = 100,
+                  pan_x: float = 0, pan_y: float = 0) -> tuple[float, float, float, float]:
+    """Aspect-fit zoomed around canvas center; pan in canvas pixels for Shift-drag.
+
+    This is a view transform only; points remain at source-image coordinates.
+    """
+    if type(zoom) is not int or zoom not in (75, 100, 125, 150, 200):
+        raise ValueError('Масштаб должен быть 75, 100, 125, 150 или 200%')
+    if not all(isfinite(v) and abs(v) <= 100000 for v in (pan_x, pan_y)):
+        raise ValueError('Недопустимое смещение плана')
+    _, _, w, h = image_bounds(canvas_width, canvas_height, image_width, image_height)
+    w, h = w * zoom/100, h * zoom/100
+    # Avoid hiding the entire image outside the canvas on extreme drag.
+    max_x = (canvas_width + w)/2 - min(w, 30)
+    max_y = (canvas_height + h)/2 - min(h, 30)
+    return ((canvas_width-w)/2 + max(-max_x, min(max_x, pan_x)),
+            (canvas_height-h)/2 + max(-max_y, min(max_y, pan_y)), w, h)
