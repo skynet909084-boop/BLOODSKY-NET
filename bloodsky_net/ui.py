@@ -23,6 +23,7 @@ from . import wifi
 from . import wifi_radar
 from . import distributed_probes as probes
 from . import probe_transport
+from . import probe_peers
 from . import wifi_survey
 from . import wifi_survey_compare
 from . import wifi_survey_audit
@@ -1362,6 +1363,15 @@ class NetApp(tk.Tk):
         tk.Entry(auth, textvariable=self.probe_peer_cert, width=45).pack(side='left', padx=5)
         self._label(auth, 'Код:', 9, color=MUTED).pack(side='left')
         tk.Entry(auth, textvariable=self.probe_peer_key, width=21, show='•').pack(side='left', padx=5)
+        actions = tk.Frame(secure, bg=PANEL)
+        actions.pack(fill='x', padx=11, pady=3)
+        self._button(actions, 'Доверенные получатели', self._probes_trusted_dialog).pack(side='left')
+        self._button(actions, 'Журнал измерений', self._probes_activity_dialog).pack(side='left', padx=8)
+        self.probes_activity_note = self._label(actions, 'Входящих измерений пока нет', 9, color=MUTED)
+        self.probes_activity_note.pack(side='left', padx=7)
+        self._label(secure, 'Сохранённый отпечаток доверяет только получателю, а не отправителю: '
+                    'имя входящего пакета задаётся отправителем. Пропуск данных ≠ отключение компьютера.',
+                    9, color=MUTED, wraplength=1030, justify='left').pack(anchor='w', padx=11, pady=(2, 3))
         self._label(secure, 'Отпечаток и код передавайте через доверенный канал. В брандмауэре Windows '
                     'может понадобиться вручную разрешить выбранный порт. Ни один порт не открывается автоматически.',
                     9, color=MUTED, wraplength=1030, justify='left').pack(anchor='w', padx=11, pady=(0, 7))
@@ -1384,6 +1394,81 @@ class NetApp(tk.Tk):
                     'Сравниваются только измерения в интервале до 5 минут. '
                     'Пропущенные/устаревшие результаты исключаются.',
                     9, color=MUTED, wraplength=1000, justify='left').pack(anchor='w', pady=(9, 0))
+
+    def _probes_trusted_dialog(self):
+        """Opt-in address and cert-pinning registry. Session bearer codes stay in RAM."""
+        dialog = tk.Toplevel(self)
+        dialog.title('Доверенные получатели · без сохранения секретов')
+        dialog.configure(bg=BG)
+        dialog.geometry('860x430')
+        panel = tk.Frame(dialog, bg=BG)
+        panel.pack(fill='both', expand=True, padx=14, pady=14)
+        self._label(panel, 'СОХРАНЕННЫЕ ПОЛУЧАТЕЛИ TLS · НЕ АУТЕНТИФИКАЦИЯ ОТПРАВИТЕЛЕЙ',
+                    10, True, BLUE).pack(anchor='w', pady=(0, 6))
+        frame, table = self._tree(panel, ('Имя','IPv4','Порт','SHA-256 сертификата'), (150,130,70,440))
+        frame.pack(fill='both', expand=True)
+        table.configure(height=5)
+        name = tk.StringVar(value='')
+        fields = tk.Frame(panel, bg=BG)
+        fields.pack(fill='x', pady=(8,4))
+        self._label(fields, 'Имя:', 9).pack(side='left')
+        tk.Entry(fields, textvariable=name, width=22).pack(side='left', padx=5)
+        self._label(fields, 'Адрес, порт и отпечаток берутся из полей отправки в основной вкладке.',
+                    9, color=MUTED).pack(side='left', padx=8)
+        def refresh():
+            table.delete(*table.get_children())
+            for p in self.store.trusted_destinations():
+                table.insert('', 'end', iid=p.alias, values=(p.alias,p.host,p.port,p.fingerprint))
+        def save():
+            try:
+                self.store.upsert_trusted_destination(name.get(),self.probe_peer_host.get(),
+                    int(self.probe_peer_port.get()),self.probe_peer_cert.get())
+                refresh()
+            except (ValueError,sqlite3.Error) as exc:
+                messagebox.showerror('Доверенные получатели',str(exc),parent=dialog)
+        def selected():
+            selection = table.selection()
+            return next((p for p in self.store.trusted_destinations() if p.alias in selection),None)
+        def use():
+            p=selected()
+            if p:
+                self.probe_peer_host.set(p.host)
+                self.probe_peer_port.set(str(p.port))
+                self.probe_peer_cert.set(p.fingerprint)
+                self.probe_peer_key.set('')  # Never carry over an old bearer token.
+                self.probe_auto.set(False)
+                dialog.destroy()
+        def remove():
+            p=selected()
+            if p and messagebox.askyesno('Доверенные получатели','Удалить '+p.alias+'?',parent=dialog):
+                self.store.delete_trusted_destination(p.alias)
+                refresh()
+        toolbar=tk.Frame(panel,bg=BG)
+        toolbar.pack(fill='x',pady=6)
+        self._button(toolbar,'Сохранить адрес и SHA-256',save).pack(side='left')
+        self._button(toolbar,'Использовать выбранного',use).pack(side='left',padx=7)
+        self._button(toolbar,'Удалить',remove).pack(side='left')
+        self._label(panel,'Код доступа здесь не сохраняется. Подтвердите новый отпечаток '
+                    'по доверенному каналу перед передачей измерений.',9,color=MUTED).pack(anchor='w')
+        refresh()
+
+    def _probes_activity_dialog(self):
+        dialog=tk.Toplevel(self)
+        dialog.title('Журнал обмена измерениями · UTC')
+        dialog.configure(bg=BG)
+        dialog.geometry('930x500')
+        frame=self._panel(dialog)
+        frame.pack(fill='both',expand=True,padx=12,pady=12)
+        self._label(frame,'Наблюдения по времени. Отсутствие обновлений не означает '
+                    'потерю связи с компьютером.',10,color=MUTED).pack(anchor='w',pady=(0,8))
+        block, table=self._tree(frame,('UTC','Тип','Имя (со слов отправителя)','Измерений'),
+                               (220,170,330,100))
+        block.pack(fill='both',expand=True)
+        for item in probe_peers.timeline(self.store.probe_activities(200)):
+            table.insert('', 'end',values=(item.at.isoformat(timespec='seconds'),
+                         item.event,item.label,item.count))
+        self._label(frame,'TLS: код подтверждает доступ к сеансу, но не идентичность '
+                    'отправителя. JSON-импорт не аутентифицирован.',9,color=MUTED).pack(anchor='w',pady=8)
 
     def _probes_fresh_snapshot(self):
         now = time.monotonic()
@@ -1438,10 +1523,13 @@ class NetApp(tk.Tk):
             return
         self.probe_send_busy = True
         self.probe_last_auto = time.monotonic()
+        # Trust is PINNED DESTINATION ONLY. Incoming source labels remain claims.
+        peer_alias = next((p.alias for p in self.store.trusted_destinations()
+                           if (p.host,p.port,p.fingerprint)==(host,port,cert)),host)
         def worker():
             try:
                 probe_transport.send_snapshot(host, port, cert, code, snapshot)
-                self.messages.put(('probe_send_result', True, 'TLS-пакет принят удалённой точкой.'))
+                self.messages.put(('probe_send_result', True, 'TLS-пакет принят удалённой точкой.',peer_alias,len(snapshot.readings)))
             except Exception:
                 self.messages.put(('probe_send_result', False, 'Обмен не удался: проверьте сеть, TLS и код получателя.'))
         threading.Thread(target=worker, daemon=True, name='BloodskyProbeSend').start()
@@ -1457,14 +1545,17 @@ class NetApp(tk.Tk):
                 except queue.Empty: break
                 try:
                     self.store.save_probe_package(snapshot)
+                    self.store.record_probe_activity('tls_received',snapshot.label,len(snapshot.readings))
                     imported = True
                 except (ValueError, sqlite3.Error):
                     self._set_status('Удалённый пакет отклонён SQLite')
             if imported:
                 self._probes_refresh()
-                self._set_status('Аутентифицированный TLS-пакет получен. Содержимое ICMP не проверено независимо.')
+                self._set_status('TLS-пакет с кодом сеанса получен; имя отправителя не подтверждено.')
         if self.probe_auto.get() and not self.probe_send_busy and time.monotonic()-self.probe_last_auto >= 60:
             self._probes_send()
+        note,_ = probe_peers.recent_receive_state(self.store.probe_activities(200),datetime.now(timezone.utc))
+        self.probes_activity_note.configure(text=note)
         self.after(1000, self._probes_network_tick)
 
     def _probes_export(self):
@@ -1490,6 +1581,7 @@ class NetApp(tk.Tk):
             with open(path, 'wb') as fd:
                 fd.write(data)
             self.store.save_probe_package(snapshot)
+            self.store.record_probe_activity('local_exported',snapshot.label,len(snapshot.readings))
             self._probes_refresh()
             self._set_status('ICMP-наблюдения сохранены локально. Передайте файл вручную.')
         except (OSError, sqlite3.Error) as exc:
@@ -1505,6 +1597,7 @@ class NetApp(tk.Tk):
                 data = fd.read(probes.MAX_BYTES + 1)
             snapshot = probes.decode(data)
             self.store.save_probe_package(snapshot)
+            self.store.record_probe_activity('file_imported',snapshot.label,len(snapshot.readings))
         except (ValueError, OSError, sqlite3.Error) as exc:
             messagebox.showerror('Точки наблюдения', f'Файл отклонён: {exc}', parent=self)
             return
@@ -1836,6 +1929,8 @@ class NetApp(tk.Tk):
                         self.monitoring = False
                 elif kind == 'probe_send_result':
                     self.probe_send_busy = False
+                    if item[1] and len(item) >= 5:
+                        self.store.record_probe_activity('tls_sent',item[3],item[4])
                     self._set_status(item[2])
                 elif kind == "tray_show":
                     self.show_window()
