@@ -23,6 +23,8 @@ EVENT_MAX_ROWS = 25000
 SNAPSHOT_RETENTION_DAYS = 7
 SNAPSHOT_MAX_ROWS = 2016
 SNAPSHOT_MAX_DEVICES = 512
+LLDP_CAPTURE_MAX_ROWS = 2016
+LLDP_RETENTION_DAYS = 7
 
 
 class Storage:
@@ -63,6 +65,15 @@ class Storage:
                 vendor TEXT NOT NULL,
                 PRIMARY KEY(snapshot_id, ip),
                 FOREIGN KEY(snapshot_id) REFERENCES network_snapshots(id) ON DELETE CASCADE)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS lldp_captures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+                source_ip TEXT NOT NULL, system_name TEXT NOT NULL, neighbor_count INTEGER NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS lldp_observations (
+                capture_id INTEGER NOT NULL, local_port_num INTEGER NOT NULL,
+                local_port TEXT NOT NULL, remote_chassis TEXT NOT NULL,
+                remote_port TEXT NOT NULL, remote_name TEXT NOT NULL,
+                FOREIGN KEY(capture_id) REFERENCES lldp_captures(id) ON DELETE CASCADE)""")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_lldp_captures_ip ON lldp_captures(source_ip, id)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_network_snapshots_ts ON network_snapshots(ts)")
         self.db.commit()
         self._wifi_writes = 0
@@ -285,6 +296,62 @@ class Storage:
             raise ValueError('Select two different existing snapshots')
         return diff(self.network_snapshot_devices(before_id),
                     self.network_snapshot_devices(after_id))
+
+    def save_lldp_capture(self, snapshot, ts: str | None = None) -> int:
+        """Store only successful SNMP/LLDP observations, atomically.
+
+        Caller must not invoke this on transport errors or incomplete polling.
+        A successful empty neighbor table is a valid, empty observation.
+        """
+        from datetime import datetime
+        from .topology_history import observations
+        address = ipaddress.IPv4Address(snapshot.source_ip)
+        if not address.is_private or address.is_loopback or address.is_link_local:
+            raise ValueError('Local private SNMP IPv4 required')
+        if ts is not None:
+            parsed = datetime.fromisoformat(ts)
+            if parsed.tzinfo is None:
+                raise ValueError('LLDP timestamp must have timezone')
+        rows = observations(snapshot)
+        stamp = ts or now_iso()
+        with self.db:
+            cur = self.db.execute(
+                'INSERT INTO lldp_captures(ts,source_ip,system_name,neighbor_count) VALUES(?,?,?,?)',
+                (stamp, str(address), str(snapshot.system_name)[:120], len(rows)))
+            ident = cur.lastrowid
+            self.db.executemany(
+                'INSERT INTO lldp_observations(capture_id,local_port_num,local_port,remote_chassis,remote_port,remote_name) '
+                'VALUES(?,?,?,?,?,?)', [(ident, row.local_port_num, row.local_port, row.remote_chassis,
+                                          row.remote_port, row.remote_name) for row in rows])
+            self.db.execute("DELETE FROM lldp_captures WHERE datetime(ts) < datetime('now', ?)",
+                            (f'-{LLDP_RETENTION_DAYS} days',))
+            self.db.execute('DELETE FROM lldp_captures WHERE id NOT IN '
+                            '(SELECT id FROM lldp_captures ORDER BY id DESC LIMIT ?)',
+                            (LLDP_CAPTURE_MAX_ROWS,))
+        return ident
+
+    def lldp_captures(self, limit: int = 120):
+        n = max(1, min(int(limit), 500))
+        return self.db.execute('SELECT id,ts,source_ip,system_name,neighbor_count FROM lldp_captures '
+                               'ORDER BY id DESC LIMIT ?', (n,)).fetchall()
+
+    def lldp_capture_neighbors(self, capture_id: int):
+        from .topology_history import LinkObservation
+        row = self.db.execute('SELECT source_ip FROM lldp_captures WHERE id=?', (int(capture_id),)).fetchone()
+        if row is None:
+            return []
+        return [LinkObservation(row[0], *values) for values in self.db.execute(
+            'SELECT local_port_num,local_port,remote_chassis,remote_port,remote_name '
+            'FROM lldp_observations WHERE capture_id=? ORDER BY local_port_num,remote_chassis,remote_name',
+            (int(capture_id),))]
+
+    def compare_lldp_captures(self, before_id: int, after_id: int):
+        from .topology_history import compare_links
+        rows = self.db.execute('SELECT id,source_ip FROM lldp_captures WHERE id IN (?,?)',
+                               (int(before_id), int(after_id))).fetchall()
+        if before_id == after_id or len(rows) != 2 or rows[0][1] != rows[1][1]:
+            raise ValueError('Select two different LLDP captures from the same switch')
+        return compare_links(self.lldp_capture_neighbors(before_id), self.lldp_capture_neighbors(after_id))
 
     def close(self):
         self.db.close()
