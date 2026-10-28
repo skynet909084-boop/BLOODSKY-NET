@@ -892,10 +892,14 @@ class NetApp(tk.Tk):
                  insertbackground=TEXT, relief='flat', width=18, font=('Segoe UI', 10)).pack(side='left', padx=(5, 8), ipady=6)
         entry.bind('<Return>', lambda _e: self._wifi_survey_refresh())
         self._button(bar, 'Показать этаж', self._wifi_survey_refresh).pack(side='left')
+        self.survey_series = tk.StringVar(value='Обследование 1')
         self.survey_phase = tk.StringVar(value='До')
         phasebar = tk.Frame(parent, bg=BG)
         phasebar.pack(fill='x', pady=(0, 7))
-        self._label(phasebar, 'Этап измерения:', 10, color=MUTED).pack(side='left')
+        self._label(phasebar, 'Серия:', 10, color=MUTED).pack(side='left')
+        tk.Entry(phasebar, textvariable=self.survey_series, bg=PANEL_ALT, fg=TEXT,
+                 insertbackground=TEXT, relief='flat', width=21, font=('Segoe UI', 10)).pack(side='left', padx=(5, 12), ipady=5)
+        self._label(phasebar, 'Этап:', 10, color=MUTED).pack(side='left')
         ttk.Combobox(phasebar, textvariable=self.survey_phase, state='readonly',
                      values=('До', 'После'), width=11, style='Night.TCombobox').pack(side='left', padx=8)
         self._label(phasebar, 'Масштаб:', 10, color=MUTED).pack(side='left', padx=(16, 4))
@@ -918,6 +922,8 @@ class NetApp(tk.Tk):
         self._survey_plan = None
         self._survey_photo = None
         self._button(bar, 'Экспорт CSV', self._wifi_survey_export).pack(side='right')
+        self._button(bar, 'Отчёт HTML', self._wifi_survey_export_html).pack(side='right', padx=6)
+        self._button(bar, 'Отчёт JSON', self._wifi_survey_export_json).pack(side='right')
         self.survey_note = self._label(parent, 'Для измерения подключитесь к Wi-Fi и обновите эфир на вкладке Wi-Fi.',
                                        9, color=MUTED, wraplength=950, justify='left')
         self.survey_note.pack(anchor='w', pady=(0, 7))
@@ -930,7 +936,7 @@ class NetApp(tk.Tk):
         self.survey_canvas.bind('<Shift-ButtonRelease-1>', self._wifi_survey_pan_stop)
         self._label(parent, 'СРАВНЕНИЕ КОМНАТ НА ЭТАЖЕ (WINDOWS %, НЕ dBm)', 10, True, BLUE).pack(anchor='w', pady=(4, 5))
         frame, self.survey_stats = self._tree(parent,
-            ('Комната', 'Замеров', 'Средний', 'Минимум', 'Максимум', 'BSSID'), (200, 105, 130, 110, 115, 105))
+            ('Комната', 'SSID', 'Этап', 'Замеров', 'Средний', 'Минимум', 'BSSID'), (155, 185, 90, 95, 105, 90, 80))
         frame.pack(fill='both', expand=True)
         self.survey_stats.configure(height=4)
         self.survey_stats.tag_configure('low', foreground=RED)
@@ -945,7 +951,7 @@ class NetApp(tk.Tk):
         self.survey_comparison.configure(height=3)
         self._label(parent, 'Цвет точек: красный <45%, жёлтый 45–69%, зелёный ≥70%. '
                     'Комнаты — метки пользователя; границы комнат не определяются автоматически. '
-                    'В сравнении требуется ≥2 замера на каждом этапе; разные SSID не смешиваются. ' 
+                    'В сравнении требуется ≥2 замера на каждом этапе одной серии; разные SSID не смешиваются. ' 
                     'Проценты Windows не доказывают улучшение скорости; экспорт содержит SSID/BSSID.',
                     9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', pady=(8, 0))
 
@@ -999,12 +1005,12 @@ class NetApp(tk.Tk):
         try:
             self.store.save_wifi_survey_point(
                 zone, xy[0], xy[1], state.ssid, state.bssid, state.signal, state.channel,
-                room=self.survey_room.get(), phase=self.survey_phase.get())
+                room=self.survey_room.get(), phase=self.survey_phase.get(), series=self.survey_series.get())
         except (ValueError, sqlite3.Error) as exc:
             self.survey_note.configure(text=f'Замер не сохранён: {str(exc)[:170]}')
             return
         self._wifi_survey_refresh()
-        self.survey_note.configure(text=f'Сохранён замер: {zone} / {self.survey_room.get().strip()} · {self.survey_phase.get()} · {state.ssid} · {state.signal}% · {state.bssid}')
+        self.survey_note.configure(text=f'Сохранён замер: {zone} / {self.survey_room.get().strip()} · {self.survey_series.get()} · {self.survey_phase.get()} · {state.ssid} · {state.signal}%')
 
     def _wifi_survey_refresh(self):
         try:
@@ -1012,19 +1018,22 @@ class NetApp(tk.Tk):
         except sqlite3.Error:
             self.survey_note.configure(text='Не удалось прочитать сохранённые замеры.')
             return
-        self._survey_visible_points = tuple(p for p in points if p.zone == self.survey_zone.get().strip())
+        zone, series = self.survey_zone.get().strip(), self.survey_series.get().strip()
+        self._survey_visible_points = tuple(p for p in points if p.zone == zone and p.series == series)
         self.survey_stats.delete(*self.survey_stats.get_children())
-        for z in wifi_survey.room_quality(points, self.survey_zone.get().strip()):
-            self.survey_stats.insert('', 'end', values=(z.zone, z.samples, f'{z.mean_signal:.1f}%',
-                                                      f'{z.min_signal}%', f'{z.max_signal}%', z.distinct_bssids),
-                                     tags=(wifi_survey.room_signal_status(z),))
+        for z in wifi_survey.ssid_room_quality(points, zone, series):
+            q = wifi_survey.ZoneQuality(z.room, z.samples, z.mean_signal, z.min_signal,
+                                        z.max_signal, z.bssid_count)
+            self.survey_stats.insert('', 'end', values=(z.room, z.ssid[:35], z.phase, z.samples,
+                        f'{z.mean_signal:.1f}%', f'{z.min_signal}%', z.bssid_count),
+                        tags=(wifi_survey.room_signal_status(q),))
         self.survey_comparison.delete(*self.survey_comparison.get_children())
-        for c in wifi_survey.compare_phases(points, self.survey_zone.get().strip()):
+        for c in wifi_survey.compare_phases(points, zone, series=series):
             self.survey_comparison.insert('', 'end', values=(c.room, c.ssid[:35],
                 f'{c.before_mean:.1f}% ({c.before_samples})',
                 f'{c.after_mean:.1f}% ({c.after_samples})', f'{c.delta:+.1f} п.п.'))
-        self.survey_note.configure(text=f'Замеров на этом этаже: {len(self._survey_visible_points)} · '
-            f'всего: {len(points)}. Укажите комнату и нажмите на место замера; BSSID берётся из Windows.')
+        self.survey_note.configure(text=f'Замеров: {len(self._survey_visible_points)} в серии «{series[:38]}» · '
+            f'всего: {len(points)}. Для нового обследования задайте другую серию и нажмите «Показать этаж».')
         self._wifi_survey_load_current_plan()
         self._wifi_survey_draw()
 
@@ -1123,14 +1132,50 @@ class NetApp(tk.Tk):
         try:
             with open(filename,'w',newline='',encoding='utf-8-sig') as fp:
                 writer=csv.writer(fp)
-                writer.writerow(('UTC','floor','room','phase','x_percent','y_percent','SSID','BSSID','signal_windows_percent','channel'))
+                writer.writerow(('UTC','floor','room','series','phase','x_percent','y_percent','SSID','BSSID','signal_windows_percent','channel'))
                 for p in points:
                     writer.writerow((p.observed_at,wifi_survey.spreadsheet_safe(p.zone),
-                                     wifi_survey.spreadsheet_safe(p.room),p.phase,p.x,p.y,
+                                     wifi_survey.spreadsheet_safe(p.room),wifi_survey.spreadsheet_safe(p.series),p.phase,p.x,p.y,
                                      wifi_survey.spreadsheet_safe(p.ssid),p.bssid,p.signal,p.channel))
             self._set_status(f'Wi-Fi RADAR: экспортировано {len(points)} точек')
         except OSError:
             messagebox.showerror('Wi-Fi RADAR', 'Не удалось сохранить CSV.', parent=self)
+
+    def _wifi_survey_report_data(self):
+        try:
+            return wifi_survey.survey_report(self.store.wifi_survey_points(),
+                        self.survey_zone.get(), self.survey_series.get())
+        except (sqlite3.Error, ValueError) as exc:
+            messagebox.showerror('Wi-Fi RADAR', f'Не удалось подготовить отчёт: {str(exc)[:160]}', parent=self)
+            return None
+
+    def _wifi_survey_export_json(self):
+        report = self._wifi_survey_report_data()
+        if report is None:
+            return
+        filename = filedialog.asksaveasfilename(title='Локальный отчёт Wi-Fi RADAR (содержит SSID и комнаты)',
+            defaultextension='.json', filetypes=[('JSON','*.json')], parent=self)
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as fp:
+                    json.dump(report, fp, ensure_ascii=False, indent=2)
+                self._set_status('Wi-Fi RADAR: отчёт JSON сохранён локально')
+            except OSError:
+                messagebox.showerror('Wi-Fi RADAR', 'Не удалось записать JSON.', parent=self)
+
+    def _wifi_survey_export_html(self):
+        report = self._wifi_survey_report_data()
+        if report is None:
+            return
+        filename = filedialog.asksaveasfilename(title='Локальный отчёт Wi-Fi RADAR (содержит SSID и комнаты)',
+            defaultextension='.html', filetypes=[('HTML','*.html')], parent=self)
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as fp:
+                    fp.write(wifi_survey.survey_html_report(report))
+                self._set_status('Wi-Fi RADAR: отчёт HTML сохранён локально')
+            except OSError:
+                messagebox.showerror('Wi-Fi RADAR', 'Не удалось записать HTML.', parent=self)
 
     def _page_tools(self):
         parent = self._new_page("Диагностика")
