@@ -1,5 +1,5 @@
 #define MyAppName "BLOODSKY NET"
-#define MyAppVersion "0.34.0-dev"
+#define MyAppVersion "0.35.0-rc1"
 #define MyAppExeName "BLOODSKY-NET.exe"
 
 [Setup]
@@ -7,6 +7,7 @@ AppId={{C6459D56-B4F9-4E2E-B4F2-8F8D04725061}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=BLOODSKY
+SetupIconFile=..\assets\BLOODSKY-NET.ico
 DefaultDirName={localappdata}\Programs\BLOODSKY NET
 DefaultGroupName=BLOODSKY NET
 PrivilegesRequired=lowest
@@ -16,7 +17,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 DisableWelcomePage=no
 WizardStyle=modern
 OutputDir=output
-OutputBaseFilename=BLOODSKY-NET-Setup-0.34.0-dev
+OutputBaseFilename=BLOODSKY-NET-Setup-0.35.0-rc1
 Compression=lzma
 SolidCompression=yes
 CloseApplications=yes
