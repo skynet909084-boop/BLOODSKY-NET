@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
 from . import detective_timeline
+from . import topology_incidents
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class Observation:
     port_error_deltas: Sequence[object] = ()  # Delta between fresh SNMP IF-MIB polls
     lldp_endpoints: Sequence[detective_timeline.LldpEndpoint] = ()
     timed_port_faults: Sequence[detective_timeline.TimedPortFault] = ()
+    topology_history_matches: Sequence[topology_incidents.IncidentLink] = ()
 
 
 @dataclass(frozen=True)
@@ -252,6 +254,20 @@ def diagnose(o: Observation) -> tuple[Finding, ...]:
             tuple(Evidence('Временная корреляция', x) for x in linked.evidence),
             ('Сверить журналы коммутатора и текущие статусы интерфейсов.',
              'Проверить связь другим протоколом или с другой точки; ICMP может фильтроваться.')))
+    for match in list(o.topology_history_matches)[:12]:
+        findings.append(Finding('historical_lldp_overlap', 'notice', 'низкая',
+            f'Изменение LLDP рядом со сбоем ICMP: {match.device_ip}',
+            match.description,
+            (Evidence('LLDP (два успешных снимка)',
+                f'{match.switch_ip} / {match.reported_port}: изменение таблицы между '
+                f'{match.before_at.isoformat(timespec="seconds")} и '
+                f'{match.after_at.isoformat(timespec="seconds")}'),
+             Evidence('Локальный журнал ICMP',
+                f'{match.device_ip}: нет ответа {match.event_at.isoformat(timespec="seconds")}; '
+                'IP сопоставлен через уникальный MAC инвентаря')),
+            ('Перепроверить LLDP-соседей и административное состояние порта.',
+             'Проверить питание/ACL/маршруты и диагностику другим протоколом.',
+             'Сверить изменения конфигурации, если доступен журнал коммутатора.')))
     if not findings:
         findings.append(Finding('insufficient_evidence', 'info', 'нет оценки',
             'Нет достаточных данных для диагноза',
@@ -263,11 +279,31 @@ def diagnose(o: Observation) -> tuple[Finding, ...]:
     return tuple(findings[:30])
 
 
+def triage_steps(findings: Sequence[Finding], limit: int = 8) -> tuple[str, ...]:
+    """Ordered, read-only field checks. Evidence first, no automatic remediation."""
+    if not 1 <= limit <= 20:
+        raise ValueError('Invalid triage limit')
+    by_code = {f.code: f for f in findings}
+    priority = ('lldp_port_temporal_match', 'historical_lldp_overlap',
+                'port_errors', 'common_lldp_source', 'gateway_no_icmp',
+                'temporal_cluster', 'segment_suspected', 'arp_mac_churn',
+                'wifi_disconnected', 'device_no_icmp', 'snmp_unavailable')
+    result = []
+    for code in priority:
+        f = by_code.get(code)
+        if f:
+            for step in f.checks[:3]:
+                if step not in result:
+                    result.append(step)
+    return tuple(result[:limit])
+
+
 def export_report(findings: Sequence[Finding], timeline: Sequence[detective_timeline.IncidentMoment] = ()) -> dict:
     """Explicit, bounded whitelist. Contains network IDs; caller must obtain user action."""
     return {
         'product': 'BLOODSKY NET',
-        'engine': 'DETECTIVE rules v2.1',
+        'engine': 'DETECTIVE rules v2.2',
+        'recommended_checks': list(triage_steps(findings)),
         'timeline': [{'timestamp': m.observed_at.isoformat(timespec='seconds'),
                       'source': m.source, 'observation': m.description} for m in list(timeline)[-60:]],
         'disclaimer': 'Предположения по измерениям; отсутствие ICMP/LLDP не доказывает поломку. Отчёт содержит сетевые идентификаторы.',
@@ -289,6 +325,8 @@ def export_html_report(findings: Sequence[Finding], timeline: Sequence[detective
     history_html = ('<h2>Временная шкала наблюдений</h2><table><thead><tr>'
                     '<th>UTC</th><th>Источник</th><th>Наблюдение</th></tr></thead><tbody>'
                     + incident_rows + '</tbody></table>') if incident_rows else ''
+    advice = ''.join(f'<li>{esc(a)}</li>' for a in triage_steps(findings))
+    plan_html = '<h2>Порядок проверок инженера</h2><ol>' + advice + '</ol>' if advice else ''
     sections = []
     for f in list(findings)[:30]:
         evidence = ''.join(f'<li><b>{esc(e.source)}:</b> {esc(e.observation)}</li>' for e in f.evidence[:10])
@@ -302,7 +340,7 @@ def export_html_report(findings: Sequence[Finding], timeline: Sequence[detective
             "<style>body{font:15px Arial,sans-serif;max-width:900px;margin:36px auto;color:#203044;}"
             "section{border:1px solid #ced5de;border-radius:8px;padding:14px 18px;margin:18px 0}"
             "h1,h2{color:#174a80}li{margin:6px 0}th,td{padding:7px;text-align:left;border-bottom:1px solid #ccd;}</style></head><body>"
-            "<h1>BLOODSKY NET · DETECTIVE v2.1</h1>"
+            "<h1>BLOODSKY NET · DETECTIVE v2.2</h1>"
             "<p>Локальный отчёт. Выводы вероятностны; ICMP/LLDP и счётчики не доказывают физическую поломку. "
             "Содержит сетевые идентификаторы — передавайте только уполномоченным получателям.</p>"
-            + history_html + ''.join(sections) + '</body></html>')
+            + plan_html + history_html + ''.join(sections) + '</body></html>')
