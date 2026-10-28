@@ -19,6 +19,7 @@ from . import topology
 from . import fdb
 from . import traffic
 from . import notifications
+from . import dhcp
 from .storage import Storage
 
 BG = "#0B1220"
@@ -51,6 +52,7 @@ class NetApp(tk.Tk):
         self.topology_received: dict[str, float] = {}
         self.topology_failed: set[str] = set()
         self.port_rates: dict[str, dict[int, traffic.PortRate]] = {}
+        self.selected_port: tuple[str, int] | None = None
         self.snmp_auto_enabled = False
         self.snmp_interval = 60
         self.state_lock = threading.Lock()
@@ -342,6 +344,15 @@ class NetApp(tk.Tk):
             ("SNMP IP", "Интерфейс", "Состояние", "Вход Мбит/с", "Выход Мбит/с", "Скорость порта"),
             (140, 245, 115, 145, 145, 155))
         frame.pack(fill='both', expand=True)
+        self.port_table.bind('<<TreeviewSelect>>', self._port_selected)
+        self._label(parent, 'ИСТОРИЯ ТРАФИКА ВЫБРАННОГО ПОРТА (Мбит/с)',
+                    10, True, MUTED).pack(anchor='w', pady=(12, 5))
+        self.port_history_canvas = tk.Canvas(parent, bg=PANEL, height=110, highlightthickness=0)
+        self.port_history_canvas.pack(fill='x', pady=(0, 5))
+        self.port_history_canvas.bind('<Configure>', lambda _e: self._paint_port_history())
+        self.port_history_note = self._label(parent, 'Выберите порт для просмотра локально сохранённой истории.',
+                                             9, color=MUTED)
+        self.port_history_note.pack(anchor='w', pady=(0, 5))
         self._label(parent, "Это скорость трафика по SNMP IF-MIB, а не доказательство прямого физического соединения. "
                     "«—» означает отсутствие достоверного измерения; оно не равно нулю.",
                     9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', pady=12)
@@ -376,7 +387,7 @@ class NetApp(tk.Tk):
         line = tk.Frame(control, bg=PANEL)
         line.pack(fill="x", padx=15, pady=15)
         self.tool_kind = tk.StringVar(value="Ping × 4")
-        self.tool_select = ttk.Combobox(line, values=("Ping × 4", "Traceroute", "DNS", "TCP-порт", "ARP-таблица", "Маршруты IPv4"),
+        self.tool_select = ttk.Combobox(line, values=("Ping × 4", "Traceroute", "DNS", "TCP-порт", "ARP-таблица", "Маршруты IPv4", "DHCP Windows"),
                                         textvariable=self.tool_kind, width=19,
                                         state="readonly", style="Night.TCombobox")
         self.tool_select.pack(side="left", padx=(0, 12), ipady=5)
@@ -539,6 +550,7 @@ class NetApp(tk.Tk):
                         traffic.calculate_port_rates(last.port_counters, snapshot.port_counters,
                                                      received_at - last_at)
                         if last is not None and last_at is not None else {})
+                    self.store.save_port_rates(snapshot.source_ip, self.port_rates[snapshot.source_ip])
                     self.topology_snapshots[snapshot.source_ip] = snapshot
                     self.topology_received[snapshot.source_ip] = received_at
                     self.topology_failed.discard(snapshot.source_ip)
@@ -922,7 +934,7 @@ class NetApp(tk.Tk):
                 rate = rates.get(idx)
                 def fmt(value):
                     return f'{value:.3f}' if value is not None else '—'
-                self.port_table.insert('', 'end', values=(
+                self.port_table.insert('', 'end', iid=f'{ip}|{idx}', values=(
                     ip, counter.name,
                     'Up' if counter.oper_up is True else 'Down' if counter.oper_up is False else 'неизвестно',
                     fmt(rate.inbound_mbps) if rate else '—',
@@ -933,6 +945,61 @@ class NetApp(tk.Tk):
             f'Получено {count} портов из {len(fresh)} свежих SNMP-снимков. '
             'Скорость рассчитывается по разнице последовательных 64-битных счётчиков; '
             'неизвестные значения не подменяются нулём.'))
+        self._paint_port_history()
+
+    def _port_selected(self, _event=None):
+        selected = self.port_table.selection()
+        if selected:
+            try:
+                ip, index = selected[0].rsplit('|', 1)
+                self.selected_port = (ip, int(index))
+            except (ValueError, IndexError):
+                self.selected_port = None
+        self._paint_port_history()
+
+    def _paint_port_history(self):
+        if not hasattr(self, 'port_history_canvas'):
+            return
+        if self.selected_port is None:
+            self._draw_curve(self.port_history_canvas, [], BLUE)
+            return
+        ip, idx = self.selected_port
+        rows = self.store.port_history(ip, idx)
+        received = [row[1] for row in rows]
+        transmitted = [row[2] for row in rows]
+        self._draw_port_traffic_curves(received, transmitted)
+        if len(rows) >= 2:
+            self.port_history_note.configure(
+                text=f'{ip}, ifIndex {idx}: {len(rows)} точек, {rows[0][0]} — {rows[-1][0]}. '
+                     f'Вход: {received[-1]:.3f}, выход: {transmitted[-1]:.3f} Мбит/с.')
+        else:
+            self.port_history_note.configure(text=f'{ip}, ifIndex {idx}: для графика нужно не менее двух измерений.')
+
+    def _draw_port_traffic_curves(self, received: list[float], transmitted: list[float]):
+        canvas = self.port_history_canvas
+        canvas.delete('all')
+        w, h = max(90, canvas.winfo_width()), max(75, canvas.winfo_height())
+        left, right, top, bottom = 32, 10, 12, 20
+        usable_h = max(10, h - top - bottom)
+        usable_w = max(10, w - left - right)
+        for i in range(4):
+            y = top + usable_h * i / 3
+            canvas.create_line(left, y, w - right, y, fill=BORDER, dash=(3, 5))
+        if len(received) < 2:
+            canvas.create_text(w / 2, h / 2, text='История появится после двух замеров порта',
+                               fill=MUTED, font=('Segoe UI', 10))
+            return
+        maximum = max(1.0, max(received + transmitted) * 1.15)
+        for values, color in ((received, BLUE), (transmitted, GREEN)):
+            points = []
+            for i, value in enumerate(values):
+                x = left + usable_w * i / (len(values) - 1)
+                y = top + usable_h * (1 - min(1.0, value / maximum))
+                points.extend([x, y])
+            canvas.create_line(*points, fill=color, width=2)
+        canvas.create_text(left + 5, h - 5, anchor='w', text='Вход', fill=BLUE, font=('Segoe UI', 9))
+        canvas.create_text(left + 63, h - 5, anchor='w', text='Выход', fill=GREEN, font=('Segoe UI', 9))
+        canvas.create_text(left - 2, top, anchor='e', text=f'{maximum:.1f}', fill=MUTED, font=('Segoe UI', 8))
 
     def _paint_fdb(self, devices):
         self.fdb_table.delete(*self.fdb_table.get_children())
@@ -1062,19 +1129,21 @@ class NetApp(tk.Tk):
     def run_tool(self):
         kind = self.tool_kind.get()
         target = self.tool_target.get().strip()
-        if kind not in ("ARP-таблица", "Маршруты IPv4"):
+        if kind not in ("ARP-таблица", "Маршруты IPv4", "DHCP Windows"):
             try:
                 target = net.valid_target(target)
             except ValueError as exc:
                 messagebox.showwarning("Цель диагностики", str(exc), parent=self)
                 return
-        try:
-            port = int(self.tool_port.get())
-            if not 1 <= port <= 65535:
-                raise ValueError
-        except ValueError:
-            messagebox.showwarning("Порт", "Укажите TCP-порт от 1 до 65535", parent=self)
-            return
+        port = 443
+        if kind == "TCP-порт":
+            try:
+                port = int(self.tool_port.get())
+                if not 1 <= port <= 65535:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("Порт", "Укажите TCP-порт от 1 до 65535", parent=self)
+                return
         self.tool_button.configure(state="disabled")
         self._console_text(f"$ {kind}  {target}\n\nВыполняется…")
         threading.Thread(target=self._tool_worker, args=(kind, target, port), daemon=True).start()
@@ -1106,6 +1175,8 @@ class NetApp(tk.Tk):
                     code = 1
             elif kind == "ARP-таблица":
                 code, result = net.command(["arp", "-a"], timeout=8)
+            elif kind == "DHCP Windows":
+                code, result = dhcp.read_dhcp_configuration()
             else:
                 code, result = net.command(["route", "print", "-4"] if net.os.name == "nt"
                                            else ["ip", "-4", "route"], timeout=8)
