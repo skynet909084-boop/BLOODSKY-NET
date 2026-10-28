@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from collections import deque
+import json
+import sqlite3
 from dataclasses import asdict
 import ipaddress
 import sys
@@ -18,6 +20,7 @@ from . import network as net
 from . import wifi
 from . import topology
 from . import map_view
+from . import time_machine
 from . import fdb
 from . import traffic
 from . import notifications
@@ -104,6 +107,12 @@ class NetApp(tk.Tk):
         self.map_zoom = tk.StringVar(value="100%")
         self.map_group = tk.StringVar(value="Без групп")
         self.map_manual_positions = self.store.map_positions()
+        self._timeline_status: dict[str, str] = {}  # current-session measurements only
+        self._timeline_seen_at: dict[str, float] = {}
+        self._timeline_last_capture = time.monotonic()
+        self._timeline_index: dict[str, int] = {}
+        self.timeline_before = tk.StringVar(value='')
+        self.timeline_after = tk.StringVar(value='')
         self.map_selected_ip = ""
         self._map_drag_state = None
         self._map_point_by_ip = {}
@@ -182,7 +191,7 @@ class NetApp(tk.Tk):
         self._label(brand, "N E T W O R K  M O N I T O R", 8, color=MUTED).pack(anchor="w", pady=(2, 0))
         self._label(sidebar, "РАЗДЕЛЫ", 9, True, MUTED).pack(anchor="w", padx=22, pady=(35, 12))
         navigation = [("◫", "Обзор"), ("▤", "Устройства"), ("◇", "Карта сети"),
-                      ("◉", "Wi-Fi"), ("⇅", "Порты"), ("⌁", "Диагностика"), ("▣", "События")]
+                      ("◉", "Wi-Fi"), ("⇅", "Порты"), ("◷", "Машина времени"), ("⌁", "Диагностика"), ("▣", "События")]
         for glyph, name in navigation:
             btn = tk.Button(sidebar, text=f"  {glyph}   {name}", relief="flat", borderwidth=0,
                             anchor="w", padx=19, pady=13, font=("Segoe UI", 11),
@@ -236,6 +245,7 @@ class NetApp(tk.Tk):
         self._page_map()
         self._page_wifi()
         self._page_ports()
+        self._page_time_machine()
         self._page_tools()
         self._page_events()
         self.alert_banner = self._label(right, "", 10, True, YELLOW)
@@ -257,11 +267,14 @@ class NetApp(tk.Tk):
         self.title_label.configure(text={"Обзор": "Обзор сети", "Устройства": "Обнаруженные устройства",
                                          "Карта сети": "Карта локальной сети", "Wi-Fi": "Мониторинг Wi-Fi",
                                          "Порты": "Трафик портов коммутаторов",
+                                         "Машина времени": "NETWORK TIME MACHINE",
                                          "Диагностика": "Инструменты диагностики", "События": "Журнал событий"}[page])
         for name, btn in self.nav_buttons.items():
             btn.configure(bg=PANEL_ALT if name == page else SIDEBAR,
                           fg=BLUE if name == page else TEXT)
         self._refresh_ui()
+        if page == 'Машина времени':
+            self._timeline_refresh()
 
     def _page_overview(self):
         parent = self._new_page("Обзор")
@@ -385,6 +398,118 @@ class NetApp(tk.Tk):
             (125, 165, 155, 80, 155))
         self.fdb_table.configure(height=4)
         fdb_frame.pack(fill="x")
+
+    def _page_time_machine(self):
+        parent = self._new_page('Машина времени')
+        note = self._panel(parent)
+        note.pack(fill='x', pady=(0, 12))
+        self._label(note, 'История наблюдений сети', 15, True, BLUE).pack(anchor='w', padx=15, pady=(12, 4))
+        self._label(note, 'Снимки хранятся локально 7 дней (до 2016 записей). '
+                    '«Неизвестно» не означает «отключено». Отсутствие в снимке — не доказательство потери связи.',
+                    9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', padx=15, pady=(0, 13))
+        toolbar = tk.Frame(parent, bg=BG)
+        toolbar.pack(fill='x', pady=(0, 11))
+        self._label(toolbar, 'Раньше', 9, color=MUTED).pack(side='left')
+        self.timeline_before_combo = ttk.Combobox(toolbar, state='readonly',
+            textvariable=self.timeline_before, width=26, style='Night.TCombobox')
+        self.timeline_before_combo.pack(side='left', padx=(7, 11))
+        self._label(toolbar, 'Позже', 9, color=MUTED).pack(side='left')
+        self.timeline_after_combo = ttk.Combobox(toolbar, state='readonly',
+            textvariable=self.timeline_after, width=26, style='Night.TCombobox')
+        self.timeline_after_combo.pack(side='left', padx=(7, 11))
+        self._button(toolbar, 'Сравнить', self._timeline_compare, primary=True).pack(side='left')
+        self._button(toolbar, 'Снимок сейчас', lambda: self._timeline_capture('manual')).pack(side='right')
+        self._button(toolbar, 'Экспорт JSON', self._timeline_export).pack(side='right', padx=(0, 9))
+        self.timeline_note = self._label(parent, 'Снимков ещё нет. Выполните сканирование или сохраните снимок вручную.',
+                                        10, color=MUTED)
+        self.timeline_note.pack(anchor='w', pady=(0, 9))
+        frame, self.timeline_table = self._tree(parent,
+            ('IP', 'Категория', 'Раньше', 'Позже', 'Пояснение'), (127, 158, 153, 153, 420))
+        frame.pack(fill='both', expand=True)
+        self.timeline_table.tag_configure('alarm', foreground=RED)
+        self.timeline_table.tag_configure('info', foreground=TEXT)
+
+    def _timeline_capture(self, source: str):
+        with self.state_lock:
+            devices = list(self.devices.values())
+        now = time.monotonic()
+        expiry = max(35, self.monitor_interval * 3 + 10)
+        observations = {ip: state for ip, state in self._timeline_status.items()
+                        if now - self._timeline_seen_at.get(ip, float('-inf')) <= expiry}
+        try:
+            self.store.save_network_snapshot(devices, observations,
+                self.network_value.get().strip() if self.network_value.get().strip() else '', source=source)
+            self._timeline_last_capture = now
+            if self.current_page == 'Машина времени':
+                self._timeline_refresh(select_latest=True)
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            # Never prevent live monitor updates just because snapshots failed.
+            if source == 'manual':
+                messagebox.showwarning('Машина времени', f'Не удалось сохранить снимок: {exc}', parent=self)
+            else:
+                self._set_status('История сети: не удалось сохранить снимок, мониторинг продолжается')
+
+    def _timeline_refresh(self, select_latest: bool = False):
+        rows = self.store.network_snapshots(250)
+        choices = [f'{stamp[:19]} · {source} · {count} узлов · #{ident}'
+                   for ident, stamp, _scope, source, count in rows]
+        self._timeline_index = dict(zip(choices, (r[0] for r in rows)))
+        self.timeline_before_combo.configure(values=choices)
+        self.timeline_after_combo.configure(values=choices)
+        if select_latest or self.timeline_after.get() not in self._timeline_index:
+            self.timeline_after.set(choices[0] if choices else '')
+        if select_latest or self.timeline_before.get() not in self._timeline_index:
+            self.timeline_before.set(choices[1] if len(choices) > 1 else '')
+        if len(choices) > 1:
+            self._timeline_compare()
+        else:
+            self.timeline_table.delete(*self.timeline_table.get_children())
+            self.timeline_note.configure(text=f'Сохранено снимков: {len(choices)}. Для сравнения нужно два разных снимка.')
+
+    def _timeline_changes(self):
+        a = self._timeline_index.get(self.timeline_before.get())
+        b = self._timeline_index.get(self.timeline_after.get())
+        if a is None or b is None or a == b:
+            return None
+        return a, b, self.store.compare_network_snapshots(a, b)
+
+    def _timeline_compare(self):
+        result = self._timeline_changes()
+        self.timeline_table.delete(*self.timeline_table.get_children())
+        if result is None:
+            self.timeline_note.configure(text='Выберите два разных снимка для сравнения.')
+            return
+        a, b, changes = result
+        for change in changes[:500]:
+            self.timeline_table.insert('', 'end', values=(change.ip, change.category,
+                change.before, change.after, change.description),
+                tags=('alarm' if change.category == 'availability' and change.after == 'down' else 'info',))
+        totals = time_machine.summary(changes)
+        self.timeline_note.configure(text=(
+            f'Снимки #{a} → #{b} · изменений: {len(changes)} · '
+            f'доступность: {totals["availability"]} · MAC: {totals["mac"]} · '
+            f'новых в инвентаре: {totals["new_inventory"]} · '
+            'выводы основаны только на сохранённых наблюдениях'))
+
+    def _timeline_export(self):
+        result = self._timeline_changes()
+        if result is None:
+            messagebox.showinfo('Машина времени', 'Выберите два снимка.', parent=self)
+            return
+        a, b, changes = result
+        filename = filedialog.asksaveasfilename(title='Экспорт сравнения (содержит сетевые адреса)',
+            defaultextension='.json', filetypes=[('JSON', '*.json')], parent=self)
+        if not filename:
+            return
+        payload = {'app': 'BLOODSKY NET', 'before_id': a, 'after_id': b,
+                   'warning': 'Нет измерения ≠ недоступно; новый IP ≠ новое физическое устройство.',
+                   'changes': [asdict(change) for change in changes]}
+        try:
+            with open(filename, 'w', encoding='utf-8') as fp:
+                json.dump(payload, fp, ensure_ascii=False, indent=2)
+            self._set_status('Экспорт сравнения сохранён локально.')
+        except OSError as exc:
+            messagebox.showerror('Машина времени', str(exc), parent=self)
 
     def _page_ports(self):
         parent = self._new_page("Порты")
@@ -786,6 +911,11 @@ class NetApp(tk.Tk):
             self.store.save_device(device)
         if not was_cancelled:
             self._observe_neighbors(neighbors)
+            now = time.monotonic()
+            for dev in devices:
+                self._timeline_status[dev.ip] = 'up' if dev.online else 'unknown'
+                self._timeline_seen_at[dev.ip] = now
+            self._timeline_capture('scan')
         self._scan_finished()
         self._dirty = True
         action = "Остановлено" if was_cancelled else "Завершено"
@@ -838,6 +968,16 @@ class NetApp(tk.Tk):
                                 f"{ip}  {dev.hostname}")
                     self.store.save_device(dev)
         self._observe_neighbors(neighbors)
+        now = time.monotonic()
+        with self.state_lock:
+            for ip, ping in samples.items():
+                dev = self.devices.get(ip)
+                if dev is not None:
+                    self._timeline_status[ip] = ('up' if ping.alive else
+                        ('down' if dev.failures >= 2 else 'unknown'))
+                    self._timeline_seen_at[ip] = now
+        if samples and now - self._timeline_last_capture >= 300:
+            self._timeline_capture('monitor')
         if self.gateway:
             ping = samples.get(self.gateway)
             self.latency_history.append(ping.rtt_ms if ping and ping.alive else None)
