@@ -37,6 +37,20 @@ jobs:
           if (-not (Test-Path $compiler)) { throw 'Inno Setup compiler not installed' }
           & $compiler 'installer\BLOODSKY-NET.iss'
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+      - name: Windows silent install, EXE and uninstall smoke
+        shell: pwsh
+        run: ./tools/windows_install_smoke.ps1
+      - name: Generate SHA-256 artifact checksums
+        shell: pwsh
+        run: |
+          $paths = @('dist/BLOODSKY-NET.exe') + @(Get-ChildItem installer/output/BLOODSKY-NET-Setup-*.exe | ForEach-Object FullName)
+          $paths | ForEach-Object { "$((Get-FileHash -Algorithm SHA256 $_).Hash)  $(Split-Path $_ -Leaf)" } | Out-File -FilePath checksums-sha256.txt -Encoding utf8
+      - name: Upload artifact checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLOODSKY-NET-SHA256
+          path: checksums-sha256.txt
+          if-no-files-found: error
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
