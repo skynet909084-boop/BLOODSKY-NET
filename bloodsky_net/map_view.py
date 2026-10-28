@@ -183,6 +183,12 @@ def passport(device, learned=(), links=()):
               f'Состояние: {state} · MAC: {device.mac or "неизвестен"} · Производитель: {device.vendor or "не определён"}',
               f'Имя из сети: {device.hostname or "не определено"} · источник: {device.hostname_source or "неизвестен"} · производитель по OUI (не модель)',
               f'Тип (по косвенным признакам): {device.kind} · последний ответ: {device.seen or "неизвестен"} · Ping: {f"{device.latency_ms:.1f} мс" if device.latency_ms is not None else "нет измерения"}']
+    if getattr(device, 'model', '') or getattr(device, 'claimed_manufacturer', ''):
+        pieces.append('UPnP (заявлено самим устройством, не подтверждено): '
+                      f'модель {device.model or "неизвестна"}, '
+                      f'производитель {device.claimed_manufacturer or "неизвестен"}')
+    if getattr(device, 'friendly_name', ''):
+        pieces.append(f'UPnP имя: {device.friendly_name} (объявлено устройством)')
     if links:
         ports = [f'{n.local_port} ↔ {n.remote_port or "?"}' for n in links[:3]]
         pieces.append('LLDP-наблюдения портов: ' + '; '.join(ports))
