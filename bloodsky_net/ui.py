@@ -22,6 +22,7 @@ from . import topology
 from . import map_view
 from . import time_machine
 from . import detective
+from . import port_health
 from . import fdb
 from . import traffic
 from . import notifications
@@ -60,6 +61,7 @@ class NetApp(tk.Tk):
         self.topology_received: dict[str, float] = {}
         self.topology_failed: set[str] = set()
         self.port_rates: dict[str, dict[int, traffic.PortRate]] = {}
+        self.port_error_deltas: dict[str, tuple[port_health.ErrorDelta, ...]] = {}
         self.selected_port: tuple[str, int] | None = None
         self.snmp_auto_enabled = False
         self.snmp_interval = 60
@@ -582,7 +584,7 @@ class NetApp(tk.Tk):
         parent = self._new_page('Детектив')
         note = self._panel(parent)
         note.pack(fill='x', pady=(0, 12))
-        self._label(note, 'ПОИСК ВЕРОЯТНЫХ ПРИЧИН · правила v1', 15, True, BLUE).pack(
+        self._label(note, 'ПОИСК ВЕРОЯТНЫХ ПРИЧИН · правила v2', 15, True, BLUE).pack(
             anchor='w', padx=15, pady=(12, 4))
         self._label(note, 'По кнопке анализирует только имеющиеся свежие ICMP/ARP/Wi-Fi/SNMP '
                     'наблюдения и последние изменения LLDP. Не отправляет данные в облако, '
@@ -592,6 +594,7 @@ class NetApp(tk.Tk):
         bar.pack(fill='x', pady=(0, 10))
         self._button(bar, 'Найти вероятную причину', self._detective_analyze, primary=True).pack(side='left')
         self._button(bar, 'Экспорт отчёта JSON', self._detective_export).pack(side='right')
+        self._button(bar, 'Отчёт HTML', self._detective_export_html).pack(side='right', padx=8)
         self.detective_note = self._label(parent, 'Нажмите кнопку. Для лучших результатов включите мониторинг и SNMP-опрос.',
                                            10, color=MUTED)
         self.detective_note.pack(anchor='w', pady=(0, 10))
@@ -658,7 +661,10 @@ class NetApp(tk.Tk):
             arp_suspicions=tuple(ip for ip in self.ip_alerts
                                  if self.ip_alert_expiry.get(ip, 0) > now),
             snmp_errors=tuple(sorted(self.topology_failed)),
-            lldp_changes=self._detective_lldp_changes())
+            lldp_changes=self._detective_lldp_changes(),
+            recent_events=detective.recent_device_events(self.store.events(250)),
+            port_error_deltas=tuple(d for ip in self._fresh_topology()
+                                    for d in self.port_error_deltas.get(ip, ())))
         self._detective_findings = detective.diagnose(obs)
         self.detective_table.delete(*self.detective_table.get_children())
         for n, f in enumerate(self._detective_findings):
@@ -700,6 +706,22 @@ class NetApp(tk.Tk):
             with open(filename, 'w', encoding='utf-8') as fp:
                 json.dump(detective.export_report(self._detective_findings), fp, ensure_ascii=False, indent=2)
             self._set_status('DETECTIVE: отчёт записан локально')
+        except OSError:
+            messagebox.showerror('Детектив', 'Не удалось сохранить отчёт.', parent=self)
+
+    def _detective_export_html(self):
+        if not self._detective_findings:
+            messagebox.showinfo('Детектив', 'Сначала выполните анализ.', parent=self)
+            return
+        filename = filedialog.asksaveasfilename(
+            title='HTML-отчёт DETECTIVE (содержит IP и имена оборудования)',
+            defaultextension='.html', filetypes=[('HTML', '*.html')], parent=self)
+        if not filename:
+            return
+        try:
+            with open(filename, 'w', encoding='utf-8') as fp:
+                fp.write(detective.export_html_report(self._detective_findings))
+            self._set_status('DETECTIVE: HTML-отчёт записан локально')
         except OSError:
             messagebox.showerror('Детектив', 'Не удалось сохранить отчёт.', parent=self)
 
@@ -1015,6 +1037,12 @@ class NetApp(tk.Tk):
                         traffic.calculate_port_rates(last.port_counters, snapshot.port_counters,
                                                      received_at - last_at)
                         if last is not None and last_at is not None else {})
+                    self.port_error_deltas[snapshot.source_ip] = (
+                        port_health.calculate_error_deltas(
+                            snapshot.source_ip, last.error_counters, snapshot.error_counters,
+                            received_at - last_at,
+                            {idx: port.name for idx, port in snapshot.port_counters.items()})
+                        if last is not None and last_at is not None else ())
                     self.store.save_port_rates(snapshot.source_ip, self.port_rates[snapshot.source_ip])
                     try:
                         self.store.save_lldp_capture(snapshot)
@@ -1033,6 +1061,7 @@ class NetApp(tk.Tk):
                     self.snmp_busy = False
                     self.topology_failed.add(item[1])
                     self.port_rates.pop(item[1], None)
+                    self.port_error_deltas.pop(item[1], None)
                     self.snmp_due[item[1]] = time.monotonic() + self.snmp_interval
                     self._set_status(f"SNMP {item[1]}: ошибка чтения, снимок помечен устаревшим")
                     self._event("warning", "SNMP/LLDP", f"{item[1]}: опрос не удался (проверьте SNMP/ACL)")
