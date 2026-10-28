@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import __version__
 from . import network as net
 from . import wifi
+from . import wifi_radar
 from . import topology
 from . import map_view
 from . import time_machine
@@ -846,6 +847,17 @@ class NetApp(tk.Tk):
         self.wifi_signal_canvas = tk.Canvas(parent, bg=PANEL, highlightthickness=0, height=110)
         self.wifi_signal_canvas.pack(fill="x", pady=(0, 14))
         self.wifi_signal_canvas.bind("<Configure>", lambda _e: self._draw_curve(self.wifi_signal_canvas, list(self.signal_history), BLUE, 100))
+        radar_line = tk.Frame(parent, bg=BG)
+        radar_line.pack(fill='x', pady=(0, 6))
+        self._label(radar_line, 'WI-FI RADAR · НАБЛЮДЕНИЯ, НЕ РАДИОСПЕКТР', 10, True, BLUE).pack(side='left')
+        self._button(radar_line, 'Анализ истории', self._wifi_radar_refresh).pack(side='right')
+        self.wifi_radar_note = self._label(parent, 'Нажмите «Анализ истории» для проверки переключений и провалов сигнала.',
+                                          9, color=MUTED, wraplength=950, justify='left')
+        self.wifi_radar_note.pack(anchor='w', pady=(0, 6))
+        radar_frame, self.wifi_radar_table = self._tree(parent,
+            ('Время UTC', 'Событие', 'Измерение'), (180, 165, 620))
+        radar_frame.pack(fill='x', pady=(0, 9))
+        self.wifi_radar_table.configure(height=4)
         self._label(parent, "ТОЧКИ ДОСТУПА В ЗОНЕ ВИДИМОСТИ", 10, True, MUTED).pack(anchor="w", pady=(0, 9))
         frame, self.wifi_table = self._tree(parent,
             ("SSID", "BSSID", "Сигнал", "Канал", "Диапазон*", "Защита", "Стандарт"),
@@ -1299,6 +1311,14 @@ class NetApp(tk.Tk):
         self._dirty = True
 
     def _update_wifi(self, report):
+        # Unreadable WLAN output is not an observed disconnection; keep the
+        # measurement gap instead of inventing a 0% sample or roaming event.
+        if report.status.issue or not report.status.adapter or not report.status.state:
+            self.wifi_previously_observed = False
+            self.wifi_report = report
+            self.signal_history.append(None)
+            self._dirty = True
+            return
         previous = self.wifi_report.status
         state = report.status
         if self.wifi_previously_observed:
@@ -1401,6 +1421,28 @@ class NetApp(tk.Tk):
         if self.selected_ip:
             self.tool_target.set(self.selected_ip)
             self.show_page("Диагностика")
+
+    def _wifi_radar_refresh(self):
+        """Manual, local analysis; no additional WLAN scan or radio claims."""
+        try:
+            samples = wifi_radar.normalize_rows(self.store.wifi_radar_rows())
+            result = wifi_radar.analyze(samples)
+        except (ValueError, TypeError, sqlite3.Error):
+            self.wifi_radar_note.configure(text='История Wi-Fi недоступна для анализа.')
+            return
+        level = f'{result.mean_signal:.1f}%' if result.mean_signal is not None else 'нет измерений'
+        self.wifi_radar_note.configure(text=(
+            f'Сэмплов: {result.sample_count} · подключено: {result.connected_samples} · '
+            f'средний сигнал Windows: {level} · смен BSSID: {result.roams} · '
+            f'наблюдавшихся отключений: {result.disconnections} · '
+            f'периодов слабого сигнала: {result.low_signal_periods}. '
+            'Пропущенные опросы не считаются отключением; % — не RSSI dBm.'))
+        self.wifi_radar_table.delete(*self.wifi_radar_table.get_children())
+        labels = {'roam': 'Переход BSSID', 'disconnect': 'Отключение',
+                  'network_change': 'Смена SSID', 'weak_signal': 'Слабый сигнал'}
+        for item in reversed(result.events[-60:]):
+            self.wifi_radar_table.insert('', 'end', values=(
+                item.at.isoformat(timespec='seconds'), labels.get(item.kind, item.kind), item.detail[:240]))
 
     def _paint_wifi(self):
         report = self.wifi_report
