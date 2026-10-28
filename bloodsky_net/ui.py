@@ -21,6 +21,7 @@ from . import network as net
 from . import wifi
 from . import wifi_radar
 from . import wifi_survey
+from . import wifi_survey_compare
 from . import wifi_floorplan
 from . import topology
 from . import map_view
@@ -893,6 +894,7 @@ class NetApp(tk.Tk):
         entry.bind('<Return>', lambda _e: self._wifi_survey_refresh())
         self._button(bar, 'Показать этаж', self._wifi_survey_refresh).pack(side='left')
         self.survey_series = tk.StringVar(value='Обследование 1')
+        self.survey_compare_series = tk.StringVar(value='')
         self.survey_phase = tk.StringVar(value='До')
         phasebar = tk.Frame(parent, bg=BG)
         phasebar.pack(fill='x', pady=(0, 7))
@@ -912,6 +914,15 @@ class NetApp(tk.Tk):
         self._survey_pan_anchor = None
         self._button(phasebar, 'Сбросить вид', self._wifi_survey_reset_view).pack(side='left', padx=10)
         self._label(phasebar, 'Shift + перетаскивание — сдвинуть план', 9, color=MUTED).pack(side='left')
+        comparebar = tk.Frame(parent, bg=BG)
+        comparebar.pack(fill='x', pady=(0, 7))
+        self._label(comparebar, 'Другая серия для сравнения дат:', 10, color=MUTED).pack(side='left')
+        compare_entry = tk.Entry(comparebar, textvariable=self.survey_compare_series, bg=PANEL_ALT, fg=TEXT,
+                 insertbackground=TEXT, relief='flat', width=25, font=('Segoe UI', 10))
+        compare_entry.pack(side='left', padx=(8, 8), ipady=5)
+        compare_entry.bind('<Return>', lambda _e: self._wifi_survey_refresh())
+        self._button(comparebar, 'Сравнить обследования', self._wifi_survey_refresh).pack(side='left')
+        self._label(comparebar, 'Контур = другая серия, заливка = текущая', 9, color=MUTED).pack(side='left', padx=15)
         planbar = tk.Frame(parent, bg=BG)
         planbar.pack(fill='x', pady=(0, 7))
         self._button(planbar, 'Загрузить план PNG/JPEG', self._wifi_survey_load_plan).pack(side='left')
@@ -949,6 +960,15 @@ class NetApp(tk.Tk):
             ('Комната', 'SSID', 'До (n)', 'После (n)', 'Разница'), (180, 210, 160, 160, 125))
         cframe.pack(fill='x')
         self.survey_comparison.configure(height=3)
+        self._label(parent, 'СРАВНЕНИЕ ДВУХ СЕРИЙ — ФАКТИЧЕСКИЕ ДАТЫ, ОДИН SSID И КОМНАТА',
+                    10, True, BLUE).pack(anchor='w', pady=(8, 5))
+        vframe, self.survey_visit_comparison = self._tree(parent,
+            ('Комната','SSID','База (n)','Повтор (n)','Разница'), (175, 195, 155, 155, 125))
+        vframe.pack(fill='x')
+        self.survey_visit_comparison.configure(height=3)
+        self.survey_visit_note = self._label(parent, 'Введите другую серию в поле «Сравнить с».',
+            9, color=MUTED, wraplength=950, justify='left')
+        self.survey_visit_note.pack(anchor='w', pady=(4, 0))
         self._label(parent, 'Цвет точек: красный <45%, жёлтый 45–69%, зелёный ≥70%. '
                     'Комнаты — метки пользователя; границы комнат не определяются автоматически. '
                     'В сравнении требуется ≥2 замера на каждом этапе одной серии; разные SSID не смешиваются. ' 
@@ -1020,6 +1040,22 @@ class NetApp(tk.Tk):
             return
         zone, series = self.survey_zone.get().strip(), self.survey_series.get().strip()
         self._survey_visible_points = tuple(p for p in points if p.zone == zone and p.series == series)
+        other = self.survey_compare_series.get().strip()
+        self._survey_compare_points = tuple(p for p in points if p.zone == zone and p.series == other) if other and other != series else ()
+        self.survey_visit_comparison.delete(*self.survey_visit_comparison.get_children())
+        if other and other != series:
+            try:
+                data = wifi_survey_compare.compare_visits(points,zone,other,series)
+                for item in data['comparable_rooms']:
+                    self.survey_visit_comparison.insert('', 'end', values=(item['room'],item['ssid'][:30],
+                      f"{item['baseline_mean_windows_percent']}% ({item['baseline_samples']})",
+                      f"{item['followup_mean_windows_percent']}% ({item['followup_samples']})",
+                      f"{item['delta_percentage_points']:+.1f} п.п."))
+                self.survey_visit_note.configure(text=f"{other}: {data['baseline_dates_utc'] or 'нет измерений'} → {series}: {data['followup_dates_utc'] or 'нет измерений'} · сопоставимых комнат: {len(data['comparable_rooms'])}. Требуется ≥3 замера на одном SSID/комнате в каждой серии.")
+            except ValueError as exc:
+                self.survey_visit_note.configure(text=str(exc)[:160])
+        else:
+            self.survey_visit_note.configure(text='Для сравнения разных дат введите другую серию в поле «Сравнить с».')
         self.survey_stats.delete(*self.survey_stats.get_children())
         for z in wifi_survey.ssid_room_quality(points, zone, series):
             q = wifi_survey.ZoneQuality(z.room, z.samples, z.mean_signal, z.min_signal,
@@ -1108,6 +1144,10 @@ class NetApp(tk.Tk):
                 x = bounds[0] + bounds[2]*n/10; y = bounds[1] + bounds[3]*n/10
                 canvas.create_line(x, bounds[1], x, bounds[1]+bounds[3], fill=BORDER)
                 canvas.create_line(bounds[0], y, bounds[0]+bounds[2], y, fill=BORDER)
+        # Hollow circle means other named visit, not an interpolation or missing AP.
+        for point in getattr(self, '_survey_compare_points', ()):
+            x, y = wifi_floorplan.percent_to_canvas(point.x, point.y, bounds)
+            canvas.create_oval(x-9,y-9,x+9,y+9,fill='',outline=wifi_survey.signal_color(point.signal),width=3)
         for point in getattr(self, '_survey_visible_points', ()):
             x, y = wifi_floorplan.percent_to_canvas(point.x, point.y, bounds)
             canvas.create_oval(x-7, y-7, x+7, y+7,
@@ -1115,6 +1155,9 @@ class NetApp(tk.Tk):
             canvas.create_text(x+10, y-11, anchor='w',
                                text=f'{point.room[:12]}: {point.signal}%',
                                fill=TEXT, font=('Segoe UI', 9))
+        if getattr(self, '_survey_compare_points', ()):
+            canvas.create_text(12, 12, text='Контур = другая серия · заливка = текущая',
+                               anchor='nw', fill=BLUE, font=('Segoe UI', 9, 'bold'))
         if not getattr(self, '_survey_visible_points', ()):
             canvas.create_text(w/2, h/2, text='Нет замеров · нажмите на место измерения',
                                fill=TEXT if plan else MUTED, font=('Segoe UI', 11))
@@ -1143,8 +1186,14 @@ class NetApp(tk.Tk):
 
     def _wifi_survey_report_data(self):
         try:
-            return wifi_survey.survey_report(self.store.wifi_survey_points(),
-                        self.survey_zone.get(), self.survey_series.get())
+            points = self.store.wifi_survey_points()
+            report = wifi_survey.survey_report(points, self.survey_zone.get(), self.survey_series.get())
+            other = self.survey_compare_series.get().strip()
+            current = self.survey_series.get().strip()
+            if other and other != current:
+                report['other_visit_comparison'] = wifi_survey_compare.compare_visits(
+                    points, self.survey_zone.get(), other, current)
+            return report
         except (sqlite3.Error, ValueError) as exc:
             messagebox.showerror('Wi-Fi RADAR', f'Не удалось подготовить отчёт: {str(exc)[:160]}', parent=self)
             return None
@@ -1172,7 +1221,16 @@ class NetApp(tk.Tk):
         if filename:
             try:
                 with open(filename, 'w', encoding='utf-8') as fp:
-                    fp.write(wifi_survey.survey_html_report(report))
+                    page = wifi_survey.survey_html_report(report)
+                    data = report.get('other_visit_comparison')
+                    if data is not None:
+                        points = self.store.wifi_survey_points()
+                        zone = self.survey_zone.get().strip()
+                        before = tuple(p for p in points if p.zone == zone and p.series == data['baseline_series'])
+                        after = tuple(p for p in points if p.zone == zone and p.series == data['followup_series'])
+                        plan = self.store.wifi_floorplan(zone)
+                        page = wifi_survey_compare.compose_visit_html(page, data, before, after, plan)
+                    fp.write(page)
                 self._set_status('Wi-Fi RADAR: отчёт HTML сохранён локально')
             except OSError:
                 messagebox.showerror('Wi-Fi RADAR', 'Не удалось записать HTML.', parent=self)
