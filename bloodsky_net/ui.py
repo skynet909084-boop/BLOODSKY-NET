@@ -113,6 +113,9 @@ class NetApp(tk.Tk):
         self._timeline_index: dict[str, int] = {}
         self.timeline_before = tk.StringVar(value='')
         self.timeline_after = tk.StringVar(value='')
+        self.lldp_before = tk.StringVar(value='')
+        self.lldp_after = tk.StringVar(value='')
+        self._lldp_timeline_index = {}
         self.map_selected_ip = ""
         self._map_drag_state = None
         self._map_point_by_ip = {}
@@ -275,6 +278,7 @@ class NetApp(tk.Tk):
         self._refresh_ui()
         if page == 'Машина времени':
             self._timeline_refresh()
+            self._lldp_timeline_refresh()
 
     def _page_overview(self):
         parent = self._new_page("Обзор")
@@ -426,8 +430,66 @@ class NetApp(tk.Tk):
         frame, self.timeline_table = self._tree(parent,
             ('IP', 'Категория', 'Раньше', 'Позже', 'Пояснение'), (127, 158, 153, 153, 420))
         frame.pack(fill='both', expand=True)
+        self.timeline_table.configure(height=6)
         self.timeline_table.tag_configure('alarm', foreground=RED)
         self.timeline_table.tag_configure('info', foreground=TEXT)
+        # Separate LLDP capture sequence; inventory and SNMP polls have different clocks.
+        self._label(parent, 'ИСТОРИЯ LLDP-СОЕДИНЕНИЙ И ПОРТОВ', 10, True, BLUE).pack(anchor='w', pady=(12, 5))
+        self._label(parent, 'Только успешные опросы SNMP. Отсутствие соседа в LLDP не доказывает повреждение кабеля.',
+                    9, color=MUTED).pack(anchor='w', pady=(0, 5))
+        lbar = tk.Frame(parent, bg=BG)
+        lbar.pack(fill='x', pady=(0, 6))
+        self.lldp_before_combo = ttk.Combobox(lbar, state='readonly', textvariable=self.lldp_before,
+                                               width=37, style='Night.TCombobox')
+        self.lldp_before_combo.pack(side='left', padx=(0, 9))
+        self.lldp_after_combo = ttk.Combobox(lbar, state='readonly', textvariable=self.lldp_after,
+                                              width=37, style='Night.TCombobox')
+        self.lldp_after_combo.pack(side='left', padx=(0, 9))
+        self._button(lbar, 'Сравнить LLDP', self._lldp_timeline_compare).pack(side='left')
+        self._button(lbar, 'Обновить снимки', self._lldp_timeline_refresh).pack(side='right')
+        self.lldp_timeline_note = self._label(parent, 'История LLDP пустая. Опросите коммутатор на карте сети.',
+                                               9, color=MUTED)
+        self.lldp_timeline_note.pack(anchor='w', pady=(0, 5))
+        lframe, self.lldp_timeline_table = self._tree(parent,
+            ('Коммутатор', 'Изменение LLDP', 'Сосед', 'Раньше', 'Позже', 'Пояснение'),
+            (110, 130, 155, 120, 120, 340))
+        self.lldp_timeline_table.configure(height=4)
+        lframe.pack(fill='x')
+
+    def _lldp_timeline_refresh(self, select_latest: bool = False):
+        captures = self.store.lldp_captures(180)
+        choices = [f'{row[1][:19]} · {row[2]} · {row[4]} LLDP · #{row[0]}' for row in captures]
+        self._lldp_timeline_index = {label: (row[0], row[2]) for label, row in zip(choices, captures)}
+        self.lldp_before_combo.configure(values=choices)
+        self.lldp_after_combo.configure(values=choices)
+        if select_latest or self.lldp_after.get() not in self._lldp_timeline_index:
+            self.lldp_after.set(choices[0] if choices else '')
+        if select_latest or self.lldp_before.get() not in self._lldp_timeline_index:
+            newest_ip = captures[0][2] if captures else ''
+            self.lldp_before.set(next((label for label, row in zip(choices[1:], captures[1:])
+                                       if row[2] == newest_ip), ''))
+        self._lldp_timeline_compare()
+
+    def _lldp_timeline_compare(self):
+        self.lldp_timeline_table.delete(*self.lldp_timeline_table.get_children())
+        before = self._lldp_timeline_index.get(self.lldp_before.get())
+        after = self._lldp_timeline_index.get(self.lldp_after.get())
+        if not before or not after or before[0] == after[0]:
+            self.lldp_timeline_note.configure(text='Выберите два LLDP-снимка одного коммутатора.')
+            return
+        if before[1] != after[1]:
+            self.lldp_timeline_note.configure(text='Нельзя сравнить снимки разных коммутаторов.')
+            return
+        try:
+            changes = self.store.compare_lldp_captures(before[0], after[0])
+        except (sqlite3.Error, ValueError):
+            self.lldp_timeline_note.configure(text='Сравнение LLDP недоступно.')
+            return
+        for change in changes[:350]:
+            self.lldp_timeline_table.insert('', 'end', values=(change.source_ip, change.category,
+                change.neighbor, change.before, change.after, change.explanation))
+        self.lldp_timeline_note.configure(text=(f'LLDP-снимки #{before[0]} → #{after[0]} · '
+            f'изменений: {len(changes)}. Это изменения в таблице соседей, не диагностика целостности кабеля.'))
 
     def _timeline_capture(self, source: str):
         with self.state_lock:
@@ -824,6 +886,12 @@ class NetApp(tk.Tk):
                                                      received_at - last_at)
                         if last is not None and last_at is not None else {})
                     self.store.save_port_rates(snapshot.source_ip, self.port_rates[snapshot.source_ip])
+                    try:
+                        self.store.save_lldp_capture(snapshot)
+                        if self.current_page == 'Машина времени':
+                            self._lldp_timeline_refresh(select_latest=True)
+                    except (ValueError, sqlite3.Error):
+                        self._set_status('Не удалось сохранить историю LLDP; текущий SNMP опрос продолжает работать')
                     self.topology_snapshots[snapshot.source_ip] = snapshot
                     self.topology_received[snapshot.source_ip] = received_at
                     self.topology_failed.discard(snapshot.source_ip)
