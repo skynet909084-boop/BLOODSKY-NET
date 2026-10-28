@@ -102,6 +102,12 @@ class NetApp(tk.Tk):
         self.map_query = tk.StringVar(value="")
         self.map_status = tk.StringVar(value="Все")
         self.map_zoom = tk.StringVar(value="100%")
+        self.map_group = tk.StringVar(value="Без групп")
+        self.map_manual_positions = self.store.map_positions()
+        self.map_selected_ip = ""
+        self._map_drag_state = None
+        self._map_point_by_ip = {}
+        self._map_center = (0, 0)
         self._dirty = False
         self._last_paint = 0.0
         self._closed = False
@@ -333,6 +339,11 @@ class NetApp(tk.Tk):
                             textvariable=self.map_zoom, width=5, style="Night.TCombobox")
         zoom.pack(side="left")
         zoom.bind("<<ComboboxSelected>>", lambda _event: self._draw_map())
+        group = ttk.Combobox(top, state="readonly", values=map_view.GROUP_OPTIONS,
+                             textvariable=self.map_group, width=14, style="Night.TCombobox")
+        group.pack(side="left", padx=(8, 0))
+        group.bind("<<ComboboxSelected>>", lambda _event: self._draw_map())
+        self._button(top, "Сбросить позиции", self._reset_map_positions).pack(side="right", padx=(7, 0))
         self._button(top, "Сохранить карту SVG", self.export_map).pack(side="right", padx=(8, 0))
         self._button(top, "Опрос SNMP/LLDP", self._snmp_dialog, primary=True).pack(side="right")
         self._button(top, "Стоп автоопрос", self._stop_snmp_auto).pack(side="right", padx=(0, 8))
@@ -352,6 +363,11 @@ class NetApp(tk.Tk):
             "──── Синий — LLDP-наблюдение   - - - Пунктир — схема, не кабель",
             9, color=MUTED)
         self.map_legend.pack(anchor="w", pady=(5, 0))
+        self.map_device_detail = self._label(parent,
+            "Нажмите на устройство: откроется паспорт. Перетащите узел для сохранения позиции. "
+            "VLAN/порт из FDB — наблюдение, не прямой кабель.", 9, color=TEXT,
+            justify="left", wraplength=1080)
+        self.map_device_detail.pack(anchor="w", pady=(6, 4))
         self.topology_note = self._label(parent, "LLDP: ещё не опрашивались управляемые устройства. Сплошная линия — подтверждённый LLDP-сосед.",
                                          9, color=MUTED)
         self.topology_note.pack(anchor="w", pady=(8, 5))
@@ -987,20 +1003,26 @@ class NetApp(tk.Tk):
         return map_view.select_devices(devices, self.map_query.get(),
                                        self.map_status.get(), self.ip_alerts)
 
+    def _map_layout(self, devices):
+        zoom = int(self.map_zoom.get().rstrip("%")) / 100.0
+        return map_view.layout_positions(devices, zoom, self.map_group.get(),
+                                         self.map_manual_positions)
+
     def _draw_map(self, devices=None):
         if not hasattr(self, "map_canvas"):
             return
         view = self._map_selection(devices)
-        zoom = int(self.map_zoom.get().rstrip("%")) / 100.0
         canvas = self.map_canvas
         canvas.delete("all")
         width, height = max(canvas.winfo_width(), 880), max(canvas.winfo_height(), 590)
         center_x, center_y = width // 2, max(280, height // 2)
+        self._map_center = (center_x, center_y)
         observed = map_view.lldp_edges(self._fresh_topology(), view.devices)
+        fdb_rows = map_view.learned_ports(self._fresh_topology(), view.devices)
         canvas.create_text(24, 22,
-                           text=f"LIVE MAP · показано {len(view.devices)} из {view.total_matched} "
-                                f"(всего {view.total_inventory}) · LLDP-соседств: {len(observed)}",
-                           fill=MUTED, anchor="w", font=("Segoe UI Semibold", 10))
+            text=f"LIVE MAP · показано {len(view.devices)} из {view.total_matched} "
+                 f"(всего {view.total_inventory}) · LLDP-соседств: {len(observed)}",
+            fill=MUTED, anchor="w", font=("Segoe UI Semibold", 10))
         canvas.create_oval(center_x-68, center_y-46, center_x+68, center_y+46,
                            fill="#1B4566", outline=BLUE, width=2)
         canvas.create_text(center_x, center_y-10, text="ЛОКАЛЬНАЯ", fill=TEXT,
@@ -1009,16 +1031,21 @@ class NetApp(tk.Tk):
                            font=("Segoe UI Semibold", 10))
         canvas.create_text(center_x, center_y+57, text=f"Шлюз: {self.gateway or '—'}",
                            fill=BLUE, font=("Segoe UI", 10))
-        positions = map_view.ring_positions(view.devices, zoom)
-        reach = max((abs(x) for _, x, _ in positions), default=185 * zoom)
-        reach_y = max((abs(y) for _, _, y in positions), default=185 * zoom)
-        canvas.configure(scrollregion=(min(0, center_x-reach-155), min(0, center_y-reach_y-115),
-                                       max(width, center_x+reach+155),
-                                       max(height, center_y+reach_y+105)))
+        positions = self._map_layout(view.devices)
+        reach = max((abs(x) for _, x, _ in positions), default=185)
+        reach_y = max((abs(y) for _, _, y in positions), default=185)
+        canvas.configure(scrollregion=(min(0, center_x-reach-170), min(0, center_y-reach_y-155),
+                                       max(width, center_x+reach+170),
+                                       max(height, center_y+reach_y+155)))
+        for group, (gx, gy) in map_view.group_centers(positions, self.map_group.get()).items():
+            canvas.create_text(center_x+gx, center_y+gy, text=f"ГРУППА: {group}"[:55],
+                               fill=BLUE, font=("Segoe UI Semibold", 10))
         for dev, dx, dy in positions:
             x, y = center_x+dx, center_y+dy
-            canvas.create_line(center_x, center_y, x, y, fill="#2D4761", width=1, dash=(4, 4))
+            canvas.create_line(center_x, center_y, x, y, fill="#2D4761", width=1,
+                               dash=(4, 4))  # illustrative scheme, not a physical cable
         point_by_ip = {dev.ip: (center_x+dx, center_y+dy) for dev, dx, dy in positions}
+        self._map_point_by_ip = point_by_ip
         for source, target, neighbor in observed:
             if source not in point_by_ip or target not in point_by_ip:
                 continue
@@ -1032,21 +1059,87 @@ class NetApp(tk.Tk):
             x, y = center_x+dx, center_y+dy
             key = f"host:{dev.ip}"
             color = YELLOW if dev.ip in self.ip_alerts else (GREEN if dev.online else RED)
+            outline = BLUE if dev.ip == self.map_selected_ip else BG
             canvas.create_oval(x-12, y-12, x+12, y+12,
-                               fill=color, outline=BG, width=2, tags=(key, "node"))
+                               fill=color, outline=outline, width=3, tags=(key, "node"))
             canvas.create_text(x, y+23, text=dev.ip, fill=TEXT,
                                font=("Consolas", 10), tags=(key, "node"))
             canvas.create_text(x, y+38, text=(dev.hostname or dev.kind)[:24], fill=MUTED,
                                font=("Segoe UI", 9), tags=(key, "node"))
-            canvas.tag_bind(key, "<Button-1>", lambda e, ip=dev.ip: self._map_pick(ip))
+            evidence = fdb_rows.get(dev.ip, ())
+            if evidence:
+                if len(evidence) == 1:
+                    ent = evidence[0]
+                    label = f"FDB: {ent.interface[:12]} · VLAN {ent.vlan if ent.vlan is not None else '?'}"
+                else:
+                    label = f"FDB: {len(evidence)} наблюдения (порт неоднозначен)"
+                canvas.create_text(x, y+53, text=label[:52], fill=YELLOW,
+                                   font=("Segoe UI", 8), tags=(key, "node"))
+            canvas.tag_bind(key, "<ButtonPress-1>", lambda e, ip=dev.ip: self._map_drag_begin(e, ip))
+            canvas.tag_bind(key, "<B1-Motion>", lambda e, ip=dev.ip: self._map_drag_move(e, ip))
+            canvas.tag_bind(key, "<ButtonRelease-1>", lambda e, ip=dev.ip: self._map_drag_end(e, ip))
         if view.omitted:
             canvas.create_text(24, 46, text=f"Ещё {view.omitted} узлов не помещаются на карту: уточните фильтр",
                                fill=YELLOW, anchor="w", font=("Segoe UI", 9))
         if not view.devices:
-            msg = ("Нет устройств под текущим фильтром" if view.total_inventory else
-                   "Начните сканирование подсети для построения карты")
-            canvas.create_text(center_x, center_y+85, text=msg,
-                               fill=MUTED, font=("Segoe UI", 12))
+            canvas.create_text(center_x, center_y+85,
+                text=("Нет устройств под текущим фильтром" if view.total_inventory else
+                      "Начните сканирование подсети для построения карты"),
+                fill=MUTED, font=("Segoe UI", 12))
+        if self.map_selected_ip in {d.ip for d in view.devices}:
+            self._show_map_passport(self.map_selected_ip, view.devices, observed, fdb_rows)
+
+    def _map_drag_begin(self, event, ip):
+        self._map_drag_state = (ip, event.x, event.y, event.x, event.y)
+
+    def _map_drag_move(self, event, ip):
+        state = self._map_drag_state
+        if not state or state[0] != ip:
+            return
+        _, x0, y0, last_x, last_y = state
+        self.map_canvas.move(f"host:{ip}", event.x-last_x, event.y-last_y)
+        self._map_drag_state = (ip, x0, y0, event.x, event.y)
+
+    def _map_drag_end(self, event, ip):
+        state = self._map_drag_state
+        self._map_drag_state = None
+        if not state or state[0] != ip:
+            return
+        _, x0, y0, _, _ = state
+        dx, dy = event.x-x0, event.y-y0
+        if abs(dx) + abs(dy) < 5:
+            self._map_pick(ip)
+            return
+        if ip not in self._map_point_by_ip:
+            return
+        px, py = self._map_point_by_ip[ip]
+        zoom = int(self.map_zoom.get().rstrip("%")) / 100.0
+        x, y = (px+dx-self._map_center[0])/zoom, (py+dy-self._map_center[1])/zoom
+        if map_view.valid_position(x, y):
+            self.store.save_map_position(ip, x, y)
+            self.map_manual_positions[ip] = (x, y)
+        self._draw_map()
+
+    def _reset_map_positions(self):
+        self.store.clear_map_positions()
+        self.map_manual_positions.clear()
+        self._draw_map()
+
+    def _show_map_passport(self, ip, devices=None, observed=None, fdb_rows=None):
+        if not hasattr(self, 'map_device_detail'):
+            return
+        if devices is None:
+            with self.state_lock:
+                devices = list(self.devices.values())
+        device = next((d for d in devices if d.ip == ip), None)
+        if not device:
+            self.map_device_detail.configure(text="Выберите обнаруженное устройство")
+            return
+        fresh = self._fresh_topology()
+        observed = observed if observed is not None else map_view.lldp_edges(fresh, devices)
+        fdb_rows = fdb_rows if fdb_rows is not None else map_view.learned_ports(fresh, devices)
+        links = [n for source, target, n in observed if ip in (source, target)]
+        self.map_device_detail.configure(text=map_view.passport(device, fdb_rows.get(ip, ()), links))
 
     def _paint_neighbors(self, devices):
         self.neighbor_table.delete(*self.neighbor_table.get_children())
@@ -1249,11 +1342,9 @@ class NetApp(tk.Tk):
 
     def _map_pick(self, ip):
         self.selected_ip = ip
-        self.show_page("Устройства")
-        if self.device_table.exists(ip):
-            self.device_table.selection_set(ip)
-            self.device_table.see(ip)
-            self._device_selected()
+        self.map_selected_ip = ip
+        self._show_map_passport(ip)
+        self._draw_map()
 
     def _traffic_tick(self):
         if self._closed:
@@ -1361,7 +1452,7 @@ class NetApp(tk.Tk):
             return
         view = self._map_selection()
         zoom = int(self.map_zoom.get().rstrip("%")) / 100.0
-        positions = map_view.ring_positions(view.devices, zoom)
+        positions = self._map_layout(view.devices)
         reach = max(350, max((max(abs(x), abs(y)) for _, x, y in positions), default=185*zoom)+150)
         width = height = int(2*reach+40)
         center = width/2
@@ -1373,7 +1464,10 @@ class NetApp(tk.Tk):
             parts.append(f'<line x1="{center}" y1="{center}" x2="{x:.1f}" y2="{y:.1f}" stroke="{BORDER}" stroke-dasharray="5 6"/>')
         parts += [f'<circle cx="{center}" cy="{center}" r="59" fill="#1B4566" stroke="{BLUE}" stroke-width="2"/>',
                   f'<text x="{center}" y="{center+5}" text-anchor="middle" fill="{TEXT}" font-size="17" font-family="Segoe UI,sans-serif">LAN</text>']
+        for group, (gx, gy) in map_view.group_centers(positions, self.map_group.get()).items():
+            parts.append(f'<text x="{center+gx:.1f}" y="{center+gy:.1f}" text-anchor="middle" fill="{BLUE}" font-size="14">ГРУППА: {escape(group[:55])}</text>')
         by_ip = {d.ip: (center+dx, center+dy) for d, dx, dy in positions}
+        fdb_rows = map_view.learned_ports(self._fresh_topology(), view.devices)
         for source, target, neighbor in map_view.lldp_edges(self._fresh_topology(), view.devices):
             if source not in by_ip or target not in by_ip:
                 continue
@@ -1389,6 +1483,14 @@ class NetApp(tk.Tk):
             parts.extend([f'<circle cx="{x:.1f}" cy="{y:.1f}" r="12" fill="{color}"/>',
                           f'<text x="{x:.1f}" y="{y+30:.1f}" text-anchor="middle" fill="{TEXT}" font-family="Consolas,monospace" font-size="13">{escape(d.ip)}</text>',
                           f'<text x="{x:.1f}" y="{y+47:.1f}" text-anchor="middle" fill="{MUTED}" font-family="Segoe UI,sans-serif" font-size="11">{label}</text>'])
+            evidence = fdb_rows.get(d.ip, ())
+            if evidence:
+                if len(evidence) == 1:
+                    item = evidence[0]
+                    summary = f'FDB {item.interface[:12]} / VLAN {item.vlan if item.vlan is not None else "?"} (изучен MAC)'
+                else:
+                    summary = f'FDB: {len(evidence)} наблюдения, порт неоднозначен'
+                parts.append(f'<text x="{x:.1f}" y="{y+62:.1f}" text-anchor="middle" fill="{YELLOW}" font-size="10">{escape(summary)}</text>')
         parts.append('</svg>')
         try:
             with open(filename, "w", encoding="utf-8") as fd:
