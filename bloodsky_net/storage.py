@@ -20,6 +20,9 @@ def storage_root() -> Path:
 
 EVENT_RETENTION_DAYS = 14
 EVENT_MAX_ROWS = 25000
+SNAPSHOT_RETENTION_DAYS = 7
+SNAPSHOT_MAX_ROWS = 2016
+SNAPSHOT_MAX_DEVICES = 512
 
 
 class Storage:
@@ -28,6 +31,7 @@ class Storage:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path)
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("CREATE TABLE IF NOT EXISTS devices (ip TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, severity TEXT NOT NULL, title TEXT NOT NULL, detail TEXT NOT NULL)")
@@ -43,6 +47,23 @@ class Storage:
                 outbound_mbps REAL NOT NULL)""")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_port_traffic_device ON port_traffic(switch_ip, if_index, id)")
         self.db.execute("CREATE TABLE IF NOT EXISTS map_positions (ip TEXT PRIMARY KEY, x REAL NOT NULL, y REAL NOT NULL)")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS network_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                source TEXT NOT NULL,
+                device_count INTEGER NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS snapshot_devices (
+                snapshot_id INTEGER NOT NULL,
+                ip TEXT NOT NULL,
+                state TEXT NOT NULL,
+                mac TEXT NOT NULL,
+                hostname TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                vendor TEXT NOT NULL,
+                PRIMARY KEY(snapshot_id, ip),
+                FOREIGN KEY(snapshot_id) REFERENCES network_snapshots(id) ON DELETE CASCADE)""")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_network_snapshots_ts ON network_snapshots(ts)")
         self.db.commit()
         self._wifi_writes = 0
         self._port_writes = 0
@@ -197,6 +218,73 @@ class Storage:
     def clear_map_positions(self):
         self.db.execute("DELETE FROM map_positions")
         self.db.commit()
+
+
+    def save_network_snapshot(self, devices, states=None, scope: str = '',
+                              source: str = 'manual', ts: str | None = None) -> int:
+        """One atomic bounded inventory snapshot; only whitelisted safe columns.
+
+        'unknown' means not measured recently, not offline. No SNMP credentials,
+        port counters or unverified physical links are written here.
+        """
+        from datetime import datetime
+        from .time_machine import as_snapshot_device
+        if source not in ('manual', 'monitor', 'scan'):
+            raise ValueError('Invalid snapshot source')
+        if scope:
+            scope = str(ipaddress.IPv4Network(scope, strict=False))
+        if ts is not None:
+            parsed = datetime.fromisoformat(ts)
+            if parsed.tzinfo is None:
+                raise ValueError('Timestamp must include timezone')
+        observed = states or {}
+        prepared = {}
+        for d in devices:
+            row = as_snapshot_device(d, observed.get(d.ip, 'unknown'))
+            prepared[row.ip] = row
+            if len(prepared) > SNAPSHOT_MAX_DEVICES:
+                raise ValueError('Too many devices in one snapshot')
+        stamp = ts or now_iso()
+        with self.db:
+            cur = self.db.execute(
+                'INSERT INTO network_snapshots(ts,scope,source,device_count) VALUES (?,?,?,?)',
+                (stamp, scope, source, len(prepared)))
+            ident = cur.lastrowid
+            self.db.executemany(
+                'INSERT INTO snapshot_devices(snapshot_id,ip,state,mac,hostname,kind,vendor) VALUES (?,?,?,?,?,?,?)',
+                [(ident, row.ip, row.state, row.mac, row.hostname, row.kind, row.vendor)
+                 for row in prepared.values()])
+            self.db.execute("DELETE FROM network_snapshots WHERE datetime(ts) < datetime('now', ?)",
+                            (f'-{SNAPSHOT_RETENTION_DAYS} days',))
+            self.db.execute('DELETE FROM network_snapshots WHERE id NOT IN '
+                            '(SELECT id FROM network_snapshots ORDER BY id DESC LIMIT ?)',
+                            (SNAPSHOT_MAX_ROWS,))
+        return ident
+
+    def network_snapshots(self, limit: int = 100):
+        limit = max(1, min(int(limit), 500))
+        return self.db.execute(
+            'SELECT id,ts,scope,source,device_count FROM network_snapshots ORDER BY id DESC LIMIT ?',
+            (limit,)).fetchall()
+
+    def network_snapshot_devices(self, snapshot_id: int):
+        from .time_machine import SnapshotDevice
+        result = {}
+        for row in self.db.execute(
+            'SELECT ip,state,mac,hostname,kind,vendor FROM snapshot_devices '
+            'WHERE snapshot_id=? ORDER BY ip', (int(snapshot_id),)):
+            d = SnapshotDevice(*row)
+            result[d.ip] = d
+        return result
+
+    def compare_network_snapshots(self, before_id: int, after_id: int):
+        from .time_machine import diff
+        known = {row[0] for row in self.db.execute(
+            'SELECT id FROM network_snapshots WHERE id IN (?,?)', (int(before_id), int(after_id)))}
+        if known != {int(before_id), int(after_id)} or before_id == after_id:
+            raise ValueError('Select two different existing snapshots')
+        return diff(self.network_snapshot_devices(before_id),
+                    self.network_snapshot_devices(after_id))
 
     def close(self):
         self.db.close()
