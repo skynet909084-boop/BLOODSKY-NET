@@ -1442,8 +1442,8 @@ class NetApp(tk.Tk):
             try:
                 probe_transport.send_snapshot(host, port, cert, code, snapshot)
                 self.messages.put(('probe_send_result', True, 'TLS-пакет принят удалённой точкой.'))
-            except (ValueError, OSError, ssl.SSLError) as exc:
-                self.messages.put(('probe_send_result', False, 'Обмен не удался: '+str(exc)[:180]))
+            except Exception:
+                self.messages.put(('probe_send_result', False, 'Обмен не удался: проверьте сеть, TLS и код получателя.'))
         threading.Thread(target=worker, daemon=True, name='BloodskyProbeSend').start()
 
     def _probes_network_tick(self):
