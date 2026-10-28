@@ -123,7 +123,7 @@ class DetectiveV2Tests(unittest.TestCase):
         ui=(Path(__file__).resolve().parents[1]/'bloodsky_net/ui.py').read_text('utf-8')
         self.assertIn('def _detective_export_html(self):',ui)
         self.assertIn('port_error_deltas=tuple(',ui)
-        self.assertIn('recent_events=detective.recent_device_events(',ui)
+        self.assertIn('events = detective.recent_device_events(',ui)
 
 
 if __name__ == '__main__': unittest.main()
