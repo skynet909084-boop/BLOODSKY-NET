@@ -19,6 +19,7 @@ import queue
 import secrets
 import ssl
 import tempfile
+import time
 import threading
 from typing import Callable
 
@@ -29,6 +30,10 @@ MAX_POST_BYTES = probes.MAX_BYTES
 SESSION_AGE_SECONDS = 180
 PEER_ID = re.compile(r'^[a-z][a-z0-9_-]{0,31}$')
 MAX_TRUSTED_SENDERS = 32
+MAX_REPLAY_IDS = 4096
+REPLAY_TTL_SECONDS = SESSION_AGE_SECONDS + 10
+CONNECTION_TIMEOUT_SECONDS = 8.0
+MAX_CONCURRENT_CLIENTS = 24
 
 
 def validate_peer_id(value: str) -> str:
@@ -107,9 +112,35 @@ def _tls_credentials(directory: Path):
 
 
 class _Server(ThreadingHTTPServer):
+    """Bounded TLS workers; handshake never blocks the accept loop."""
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 8
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_CLIENTS)
+        self.ssl_context = None
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            request.settimeout(CONNECTION_TIMEOUT_SECONDS)
+            secure = self.ssl_context.wrap_socket(request, server_side=True)
+            super().process_request_thread(secure, client_address)
+        except (OSError, ssl.SSLError):
+            self.shutdown_request(request)
+        finally:
+            self._slots.release()
 
 
 class PeerReceiver:
@@ -130,7 +161,7 @@ class PeerReceiver:
         self._tmp = None
         self._httpd = None
         self._thread = None
-        self._ids = set()
+        self._ids: dict[str, float] = {}
         self._ids_lock = threading.Lock()
 
     def add_peer_hash(self, peer_id: str, digest: str) -> None:
@@ -192,7 +223,12 @@ class PeerReceiver:
                         size = int(self.headers.get('Content-Length', '-1'))
                         if not 0 < size <= MAX_POST_BYTES:
                             self.send_error(413); return
-                        raw = self.rfile.read(size)
+                        try:
+                            raw = self.rfile.read(size)
+                        except (OSError, TimeoutError):
+                            return
+                        if len(raw) != size:
+                            self.send_error(400); return
                         snapshot = probes.decode(raw)
                         if sender is not None:
                             snapshot = replace(snapshot, label=sender)
@@ -205,14 +241,16 @@ class PeerReceiver:
                                     self.headers.get('X-Bloodsky-Peer', ''),
                                     self.headers.get('Authorization', '')) is None:
                                 self.send_error(401); return
+                            clock = time.monotonic()
+                            for ident, stored_at in tuple(owner._ids.items()):
+                                if clock - stored_at > REPLAY_TTL_SECONDS:
+                                    del owner._ids[ident]
                             if snapshot.ident in owner._ids:
                                 self.send_error(409); return
-                            if owner.incoming.full():
+                            # Never clear the entire replay cache on capacity.
+                            if len(owner._ids) >= MAX_REPLAY_IDS or owner.incoming.full():
                                 self.send_error(503); return
-                            owner._ids.add(snapshot.ident)
-                            if len(owner._ids) > 512:
-                                owner._ids.clear()
-                                owner._ids.add(snapshot.ident)
+                            owner._ids[snapshot.ident] = clock
                             owner.incoming.put_nowait(snapshot)
                         self.send_response(202)
                         self.send_header('Content-Length', '0')
@@ -227,7 +265,7 @@ class PeerReceiver:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(cert, key)
-            server.socket = context.wrap_socket(server.socket, server_side=True)
+            server.ssl_context = context
             thread = threading.Thread(target=server.serve_forever, name='BloodskyProbeTLS',daemon=True)
             thread.start()
             self._httpd, self._thread, self._tmp = server,thread,tmp
