@@ -153,6 +153,9 @@ def read_wifi() -> WifiReport:
     aps = parse_wifi_aps(networks_text)
     if code or code2:
         status.issue = "Не удалось получить Wi-Fi сведения. Проверьте адаптер, службу WLAN AutoConfig и доступ к геолокации Windows."
+    if not status.adapter or not status.state:
+        status.issue = (status.issue or
+                        "Нет достоверного статуса WLAN. Проверьте адаптер и разрешения Windows.")
     warnings = wifi_warnings(status, aps)
     if status.issue:
         warnings.insert(0, status.issue)
