@@ -1229,8 +1229,7 @@ class NetApp(tk.Tk):
                         before = tuple(p for p in points if p.zone == zone and p.series == data['baseline_series'])
                         after = tuple(p for p in points if p.zone == zone and p.series == data['followup_series'])
                         plan = self.store.wifi_floorplan(zone)
-                        addition = wifi_survey_compare.comparison_html(data, before, after, plan)
-                        page = page.replace('</body>', addition + '</body>')
+                        page = wifi_survey_compare.compose_visit_html(page, data, before, after, plan)
                     fp.write(page)
                 self._set_status('Wi-Fi RADAR: отчёт HTML сохранён локально')
             except OSError:
