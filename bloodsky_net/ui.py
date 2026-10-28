@@ -20,6 +20,7 @@ from . import __version__
 from . import network as net
 from . import wifi
 from . import wifi_radar
+from . import distributed_probes as probes
 from . import wifi_survey
 from . import wifi_survey_compare
 from . import wifi_survey_audit
@@ -211,7 +212,7 @@ class NetApp(tk.Tk):
         self._label(brand, "N E T W O R K  M O N I T O R", 8, color=MUTED).pack(anchor="w", pady=(2, 0))
         self._label(sidebar, "РАЗДЕЛЫ", 9, True, MUTED).pack(anchor="w", padx=22, pady=(35, 12))
         navigation = [("◫", "Обзор"), ("▤", "Устройства"), ("◇", "Карта сети"),
-                      ("◉", "Wi-Fi"), ("▦", "Покрытие Wi-Fi"), ("⇅", "Порты"), ("◷", "Машина времени"), ("⌕", "Детектив"), ("⌁", "Диагностика"), ("▣", "События")]
+                      ("◉", "Wi-Fi"), ("▦", "Покрытие Wi-Fi"), ("⇅", "Порты"), ("◷", "Машина времени"), ("⌕", "Детектив"), ("◎", "Точки наблюдения"), ("⌁", "Диагностика"), ("▣", "События")]
         for glyph, name in navigation:
             btn = tk.Button(sidebar, text=f"  {glyph}   {name}", relief="flat", borderwidth=0,
                             anchor="w", padx=19, pady=9, font=("Segoe UI", 11),
@@ -268,6 +269,7 @@ class NetApp(tk.Tk):
         self._page_ports()
         self._page_time_machine()
         self._page_detective()
+        self._page_probes()
         self._page_tools()
         self._page_events()
         self.alert_banner = self._label(right, "", 10, True, YELLOW)
@@ -290,13 +292,15 @@ class NetApp(tk.Tk):
                                          "Карта сети": "Карта локальной сети", "Wi-Fi": "Мониторинг Wi-Fi", "Покрытие Wi-Fi": "Wi-Fi RADAR · карта замеров",
                                          "Порты": "Трафик портов коммутаторов",
                                          "Машина времени": "NETWORK TIME MACHINE", "Детектив": "BLOODSKY DETECTIVE",
-                                         "Диагностика": "Инструменты диагностики", "События": "Журнал событий"}[page])
+                                         "Диагностика": "Инструменты диагностики", "Точки наблюдения": "DISTRIBUTED PROBES · обмен измерениями", "События": "Журнал событий"}[page])
         for name, btn in self.nav_buttons.items():
             btn.configure(bg=PANEL_ALT if name == page else SIDEBAR,
                           fg=BLUE if name == page else TEXT)
         self._refresh_ui()
         if page == 'Покрытие Wi-Fi':
             self._wifi_survey_refresh()
+        if page == 'Точки наблюдения':
+            self._probes_refresh()
         if page == 'Машина времени':
             self._timeline_refresh()
             self._lldp_timeline_refresh()
@@ -1291,6 +1295,103 @@ class NetApp(tk.Tk):
                 self._set_status('Wi-Fi RADAR: отчёт HTML сохранён локально')
             except OSError:
                 messagebox.showerror('Wi-Fi RADAR', 'Не удалось записать HTML.', parent=self)
+
+    def _page_probes(self):
+        parent = self._new_page('Точки наблюдения')
+        self._label(parent, 'DISTRIBUTED PROBES · первая офлайн-версия', 14, True, BLUE).pack(
+            anchor='w', pady=(0, 5))
+        self._label(parent, 'Снимите ICMP-показания на каждом компьютере с BLOODSKY NET и вручную '
+                    'перенесите JSON-файлы сюда. Сеть не открывается для входящих подключений. '
+                    'Имя источника и данные импортированного файла не подтверждены криптографически.',
+                    9, color=MUTED, wraplength=1050, justify='left').pack(anchor='w', pady=(0, 12))
+        bar = tk.Frame(parent, bg=BG)
+        bar.pack(fill='x', pady=(0, 10))
+        self._label(bar, 'Имя точки:', 10, color=MUTED).pack(side='left')
+        self.probe_label = tk.StringVar(value='Этот компьютер')
+        tk.Entry(bar, textvariable=self.probe_label, width=22,
+                 bg=PANEL_ALT, fg=TEXT, insertbackground=TEXT, relief='flat',
+                 font=('Segoe UI', 10)).pack(side='left', ipady=7, padx=(7, 10))
+        self._button(bar, 'Сохранить мои измерения', self._probes_export, primary=True).pack(side='left')
+        self._button(bar, 'Импорт JSON', self._probes_import).pack(side='left', padx=8)
+        self._button(bar, 'Сравнить', self._probes_refresh).pack(side='left')
+        self.probes_note = self._label(parent,
+            'Нужны свежие наблюдения текущего мониторинга; сохранённый инвентарь не используется.',
+            9, color=MUTED, wraplength=1020, justify='left')
+        self.probes_note.pack(anchor='w', pady=(0, 9))
+        self._label(parent, 'ЗАГРУЖЕННЫЕ ТОЧКИ НАБЛЮДЕНИЯ · ЛОКАЛЬНАЯ ИСТОРИЯ 7 ДНЕЙ',
+                    9, True, BLUE).pack(anchor='w', pady=(0, 7))
+        fr, self.probes_packages_table = self._tree(parent,
+            ('Дата UTC', 'Точка наблюдения', 'IP-адресов'), (225, 300, 130))
+        fr.pack(fill='x')
+        self.probes_packages_table.configure(height=4)
+        self._label(parent, 'СРАВНЕНИЕ ICMP ПО РАЗНЫМ ТОЧКАМ', 10, True, BLUE).pack(
+            anchor='w', pady=(13, 7))
+        fr, self.probes_comparison_table = self._tree(parent,
+            ('IP', 'Результат', 'Наблюдения'), (160, 320, 550))
+        fr.pack(fill='both', expand=True)
+        self._label(parent, 'Отсутствие ответа ICMP не доказывает аварию. '
+                    'Сравниваются только измерения в интервале до 5 минут. '
+                    'Пропущенные/устаревшие результаты исключаются.',
+                    9, color=MUTED, wraplength=1000, justify='left').pack(anchor='w', pady=(9, 0))
+
+    def _probes_export(self):
+        now_monotonic = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
+        with self.state_lock:
+            rows = [(ip, 'reply' if state == 'up' else 'no_icmp',
+                     now_utc - timedelta(seconds=max(0, now_monotonic - self._timeline_seen_at.get(ip, 0))))
+                    for ip, state in self._timeline_status.items()
+                    if state in ('up', 'down')
+                    and 0 <= now_monotonic - self._timeline_seen_at.get(ip, 0) <= 180]
+        try:
+            snapshot = probes.create_snapshot(self.probe_label.get(), rows[:probes.MAX_ITEMS], now_utc)
+            data = probes.encode(snapshot)
+        except ValueError as exc:
+            messagebox.showwarning('Точки наблюдения', str(exc), parent=self)
+            return
+        path = filedialog.asksaveasfilename(title='Экспорт локального измерения ICMP',
+            defaultextension='.json', filetypes=[('JSON', '*.json')], parent=self)
+        if not path:
+            return
+        try:
+            with open(path, 'wb') as fd:
+                fd.write(data)
+            self.store.save_probe_package(snapshot)
+            self._probes_refresh()
+            self._set_status('ICMP-наблюдения сохранены локально. Передайте файл вручную.')
+        except (OSError, sqlite3.Error) as exc:
+            messagebox.showerror('Точки наблюдения', str(exc), parent=self)
+
+    def _probes_import(self):
+        path = filedialog.askopenfilename(title='Выберите файл с другой точки наблюдения',
+                                          filetypes=[('JSON', '*.json')], parent=self)
+        if not path:
+            return
+        try:
+            with open(path, 'rb') as fd:
+                data = fd.read(probes.MAX_BYTES + 1)
+            snapshot = probes.decode(data)
+            self.store.save_probe_package(snapshot)
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            messagebox.showerror('Точки наблюдения', f'Файл отклонён: {exc}', parent=self)
+            return
+        self._probes_refresh()
+        self._set_status('Файл точки наблюдения импортирован локально. Источник не аутентифицирован.')
+
+    def _probes_refresh(self):
+        packages = self.store.probe_packages(256)
+        self.probes_packages_table.delete(*self.probes_packages_table.get_children())
+        for item in packages[:64]:
+            self.probes_packages_table.insert('', 'end', values=(
+                item.created_at.isoformat(timespec='seconds'), item.label, len(item.readings)))
+        matches = probes.compare(packages)
+        self.probes_comparison_table.delete(*self.probes_comparison_table.get_children())
+        for match in matches[:256]:
+            values = ', '.join(f'{name}: {"ответ" if status == "reply" else "нет ответа"}'
+                               for name, status in match.observations)
+            self.probes_comparison_table.insert('', 'end', values=(match.ip, match.outcome, values))
+        self.probes_note.configure(text=f'Загружено пакетов: {len(packages)} · сравнимых IP: {len(matches)} · '
+            'имена источников задаёт пользователь, файлы не аутентифицированы')
 
     def _page_tools(self):
         parent = self._new_page("Диагностика")
