@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+from dataclasses import replace
+import re
 import hmac
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +27,25 @@ from . import distributed_probes as probes
 PORT_MIN, PORT_MAX = 1024, 65535
 MAX_POST_BYTES = probes.MAX_BYTES
 SESSION_AGE_SECONDS = 180
+PEER_ID = re.compile(r'^[a-z][a-z0-9_-]{0,31}$')
+MAX_TRUSTED_SENDERS = 32
+
+
+def validate_peer_id(value: str) -> str:
+    if type(value) is not str or not PEER_ID.fullmatch(value):
+        raise ValueError('Идентификатор отправителя: латиница a-z, цифры, _ или -, до 32 символов')
+    return value
+
+
+def fingerprint_token(token: str) -> str:
+    """Verifier for 256-bit random codes; not a password hash."""
+    return hashlib.sha256(bytes.fromhex(validate_token(token))).hexdigest()
+
+
+def validate_token_hash(value: str) -> str:
+    if type(value) is not str or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+        raise ValueError('Недопустимый хеш доступа')
+    return value
 
 
 def allowed_ip(value: str) -> str:
@@ -93,10 +114,17 @@ class _Server(ThreadingHTTPServer):
 
 class PeerReceiver:
     """Start only after a user confirms the bind address; call stop on app close."""
-    def __init__(self, host: str = '127.0.0.1', port: int = 18443):
+    def __init__(self, host: str = '127.0.0.1', port: int = 18443, *,
+                 strict_peers: bool = False, trusted_peers=None):
         self.host = allowed_ip(host)
         self.port = allowed_port(port)
-        self.token = secrets.token_hex(32)
+        # Legacy API retained for compatibility; the GUI always uses strict sender access.
+        self.strict_peers = bool(strict_peers)
+        self.token = '' if self.strict_peers else secrets.token_hex(32)
+        self._peers_lock = threading.RLock()
+        self._peers: dict[str, str] = {}
+        for peer_id, digest in (trusted_peers or {}).items():
+            self.add_peer_hash(peer_id, digest)
         self.fingerprint = ''
         self.incoming: queue.Queue[probes.ProbeSnapshot] = queue.Queue(maxsize=64)
         self._tmp = None
@@ -104,6 +132,36 @@ class PeerReceiver:
         self._thread = None
         self._ids = set()
         self._ids_lock = threading.Lock()
+
+    def add_peer_hash(self, peer_id: str, digest: str) -> None:
+        peer_id, digest = validate_peer_id(peer_id), validate_token_hash(digest)
+        with self._peers_lock:
+            if peer_id not in self._peers and len(self._peers) >= MAX_TRUSTED_SENDERS:
+                raise ValueError('Не более 32 отправителей')
+            self._peers[peer_id] = digest
+
+    def revoke_peer(self, peer_id: str) -> None:
+        peer_id = validate_peer_id(peer_id)
+        with self._peers_lock:
+            self._peers.pop(peer_id, None)
+
+    def authenticated_sender(self, peer_id: str, authorization: str) -> str | None:
+        """Proves possession of a peer key, not physical machine identity."""
+        try:
+            peer_id = validate_peer_id(peer_id)
+        except ValueError:
+            return None
+        if not authorization.startswith('Bearer ') or len(authorization) != 71:
+            return None
+        try:
+            digest = fingerprint_token(authorization[7:])
+        except ValueError:
+            return None
+        with self._peers_lock:
+            expected = self._peers.get(peer_id)
+            if expected and hmac.compare_digest(expected, digest):
+                return peer_id
+        return None
 
     def start(self):
         if self._httpd is not None:
@@ -121,18 +179,32 @@ class PeerReceiver:
                 def do_POST(self):
                     if self.path != '/probe':
                         self.send_error(404); return
-                    if not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer '+owner.token):
-                        self.send_error(401); return
+                    if owner.strict_peers:
+                        sender = owner.authenticated_sender(self.headers.get('X-Bloodsky-Peer', ''),
+                                                           self.headers.get('Authorization', ''))
+                        if sender is None:
+                            self.send_error(401); return
+                    else:
+                        sender = None
+                        if not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer '+owner.token):
+                            self.send_error(401); return
                     try:
                         size = int(self.headers.get('Content-Length', '-1'))
                         if not 0 < size <= MAX_POST_BYTES:
                             self.send_error(413); return
                         raw = self.rfile.read(size)
                         snapshot = probes.decode(raw)
+                        if sender is not None:
+                            snapshot = replace(snapshot, label=sender)
                         delta = (datetime.now(timezone.utc)-snapshot.created_at).total_seconds()
                         if not -5 <= delta <= SESSION_AGE_SECONDS:
                             self.send_error(422); return
                         with owner._ids_lock:
+                            # Recheck under queue lock: a peer may be revoked during body read.
+                            if sender is not None and owner.authenticated_sender(
+                                    self.headers.get('X-Bloodsky-Peer', ''),
+                                    self.headers.get('Authorization', '')) is None:
+                                self.send_error(401); return
                             if snapshot.ident in owner._ids:
                                 self.send_error(409); return
                             if owner.incoming.full():
@@ -178,15 +250,20 @@ class PeerReceiver:
             self._tmp.cleanup()
             self._tmp = None
         self.token = ''
+        with self._peers_lock:
+            self._peers.clear()
 
 
 def send_snapshot(host: str, port: int, fingerprint: str, token: str,
-                  snapshot: probes.ProbeSnapshot, timeout: float = 5.0) -> None:
+                  snapshot: probes.ProbeSnapshot, timeout: float = 5.0,
+                  *, peer_id: str | None = None) -> None:
     """Verify peer cert *before* writing either the key or the ICMP payload."""
     host = allowed_ip(host)
     port = allowed_port(port)
     digest = validate_fingerprint(fingerprint)
     token = validate_token(token)
+    if peer_id is not None:
+        peer_id = validate_peer_id(peer_id)
     payload = probes.encode(snapshot)
     if not -5 <= (datetime.now(timezone.utc)-snapshot.created_at).total_seconds() <= SESSION_AGE_SECONDS:
         raise ValueError('Нужны свежие измерения, выполните мониторинг заново')
@@ -200,8 +277,11 @@ def send_snapshot(host: str, port: int, fingerprint: str, token: str,
         der = conn.sock.getpeercert(binary_form=True)
         if not der or not hmac.compare_digest(hashlib.sha256(der).hexdigest(), digest):
             raise ssl.SSLError('Отпечаток сертификата не совпадает; данные не отправлены')
-        conn.request('POST','/probe',body=payload,headers={'Authorization':'Bearer '+token,
-                     'Content-Type':'application/json','Content-Length':str(len(payload))})
+        headers = {'Authorization':'Bearer '+token, 'Content-Type':'application/json',
+                   'Content-Length':str(len(payload))}
+        if peer_id is not None:
+            headers['X-Bloodsky-Peer'] = peer_id
+        conn.request('POST','/probe',body=payload,headers=headers)
         response=conn.getresponse()
         response.read(1024)
         if response.status != 202:

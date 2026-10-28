@@ -1308,7 +1308,7 @@ class NetApp(tk.Tk):
         self._label(parent, 'DISTRIBUTED PROBES · TLS-обмен только по разрешению', 14, True, BLUE).pack(
             anchor='w', pady=(0, 5))
         self._label(parent, 'Ручной JSON-обмен остаётся доступен. Защищённый LAN-обмен включается только вручную: '
-                    'TLS, проверка SHA-256 сертификата и секретный код сеанса. Без обнаружения узлов, '
+                    'TLS, проверка SHA-256 сертификата и индивидуальный код отправителя. Без обнаружения узлов, '
                     'фонового приёма при запуске или сохранения ключей. ICMP-данные остаются утверждениями источника.',
                     9, color=MUTED, wraplength=1050, justify='left').pack(anchor='w', pady=(0, 12))
         bar = tk.Frame(parent, bg=BG)
@@ -1338,7 +1338,7 @@ class NetApp(tk.Tk):
         self._button(recv, 'Включить приём', self._probes_listen).pack(side='left', padx=6)
         self._button(recv, 'Отключить', self._probes_stop).pack(side='left')
         for caption, var in [('SHA-256 сертификата', self.probe_cert),
-                              ('Код доступа сеанса', self.probe_access)]:
+                              ('Общий код (отключён в режиме 2.2)', self.probe_access)]:
             line = tk.Frame(secure, bg=PANEL)
             line.pack(fill='x', padx=11, pady=2)
             self._label(line, caption, 9, color=MUTED).pack(side='left', padx=(0, 5))
@@ -1359,18 +1359,22 @@ class NetApp(tk.Tk):
         auth.pack(fill='x', padx=11, pady=(2, 9))
         self.probe_peer_cert = tk.StringVar(value='')
         self.probe_peer_key = tk.StringVar(value='')
+        self.probe_sender_id = tk.StringVar(value='')
         self._label(auth, 'SHA-256 получателя:', 9, color=MUTED).pack(side='left')
         tk.Entry(auth, textvariable=self.probe_peer_cert, width=45).pack(side='left', padx=5)
-        self._label(auth, 'Код:', 9, color=MUTED).pack(side='left')
+        self._label(auth, 'ID отправителя:', 9, color=MUTED).pack(side='left')
+        tk.Entry(auth, textvariable=self.probe_sender_id, width=15).pack(side='left', padx=5)
+        self._label(auth, 'Личный код:', 9, color=MUTED).pack(side='left')
         tk.Entry(auth, textvariable=self.probe_peer_key, width=21, show='•').pack(side='left', padx=5)
         actions = tk.Frame(secure, bg=PANEL)
         actions.pack(fill='x', padx=11, pady=3)
         self._button(actions, 'Доверенные получатели', self._probes_trusted_dialog).pack(side='left')
+        self._button(actions, 'Разрешённые отправители', self._probes_senders_dialog).pack(side='left', padx=8)
         self._button(actions, 'Журнал измерений', self._probes_activity_dialog).pack(side='left', padx=8)
         self.probes_activity_note = self._label(actions, 'Входящих измерений пока нет', 9, color=MUTED)
         self.probes_activity_note.pack(side='left', padx=7)
-        self._label(secure, 'Сохранённый отпечаток доверяет только получателю, а не отправителю: '
-                    'имя входящего пакета задаётся отправителем. Пропуск данных ≠ отключение компьютера.',
+        self._label(secure, 'Сертификат подтверждает получателя; личный код — доступ отправителя, но не физический ПК. '
+                    'Входящие пакеты помечаются ID проверенного ключа. Пропуск данных ≠ отключение компьютера.',
                     9, color=MUTED, wraplength=1030, justify='left').pack(anchor='w', padx=11, pady=(2, 3))
         self._label(secure, 'Отпечаток и код передавайте через доверенный канал. В брандмауэре Windows '
                     'может понадобиться вручную разрешить выбранный порт. Ни один порт не открывается автоматически.',
@@ -1394,6 +1398,63 @@ class NetApp(tk.Tk):
                     'Сравниваются только измерения в интервале до 5 минут. '
                     'Пропущенные/устаревшие результаты исключаются.',
                     9, color=MUTED, wraplength=1000, justify='left').pack(anchor='w', pady=(9, 0))
+
+    def _probes_senders_dialog(self):
+        """Issue independent sender keys and revoke them immediately."""
+        dialog=tk.Toplevel(self)
+        dialog.title('Доверенные отправители · личные ключи доступа')
+        dialog.configure(bg=BG)
+        dialog.geometry('740x380')
+        panel=tk.Frame(dialog,bg=BG)
+        panel.pack(fill='both',expand=True,padx=14,pady=14)
+        self._label(panel,'РАЗРЕШЁННЫЕ ОТПРАВИТЕЛИ · КЛЮЧ ОТОБРАЖАЕТСЯ ОДИН РАЗ',
+                    10,True,BLUE).pack(anchor='w',pady=(0,8))
+        frame,table=self._tree(panel,('ID отправителя',),(450,))
+        frame.pack(fill='both',expand=True)
+        name=tk.StringVar(value='')
+        line=tk.Frame(panel,bg=BG)
+        line.pack(fill='x',pady=8)
+        self._label(line,'ID (латиница):',9).pack(side='left')
+        tk.Entry(line,textvariable=name,width=32).pack(side='left',padx=6)
+        def refresh():
+            table.delete(*table.get_children())
+            for peer_id in self.store.trusted_sender_hashes():
+                table.insert('', 'end',iid=peer_id, values=(peer_id,))
+        def add():
+            try:
+                peer_id=probe_transport.validate_peer_id(name.get())
+                if peer_id in self.store.trusted_sender_hashes() and not messagebox.askyesno(
+                    'Перевыпуск доступа','Старый ключ будет немедленно отозван. Продолжить?',parent=dialog):
+                    return
+                token=self.store.create_trusted_sender(peer_id)
+                if self.probe_receiver:
+                    self.probe_receiver.add_peer_hash(peer_id,self.store.trusted_sender_hashes()[peer_id])
+                refresh()
+                alert=tk.Toplevel(dialog)
+                alert.title('Личный ключ · показать один раз')
+                self._label(alert,'Сохраните код у отправителя; восстановить его нельзя. Передайте защищённо.',
+                            9,color=MUTED).pack(padx=14,pady=8)
+                entry=tk.Entry(alert,width=72)
+                entry.insert(0,token)
+                entry.configure(state='readonly')
+                entry.pack(padx=14,pady=7)
+                self._button(alert,'Закрыть',alert.destroy).pack(pady=8)
+            except (ValueError,sqlite3.Error) as exc:
+                messagebox.showerror('Доверенные отправители',str(exc),parent=dialog)
+        def revoke():
+            selected=table.selection()
+            if selected and messagebox.askyesno('Отозвать отправителя',
+                'Немедленно запретить ключ '+selected[0]+'?',parent=dialog):
+                self.store.revoke_trusted_sender(selected[0])
+                if self.probe_receiver:
+                    self.probe_receiver.revoke_peer(selected[0])
+                refresh()
+        self._button(line,'Выдать / перевыпустить ключ',add).pack(side='left',padx=5)
+        self._button(line,'Отозвать выбранный',revoke).pack(side='left')
+        self._label(panel,'Коды не записываются в SQLite. После перезапуска отправитель вводит свой код снова. '
+                    'Сертификат получателя меняется при новом включении приёма — перепроверьте SHA-256.',
+                    9,color=MUTED,wraplength=660,justify='left').pack(anchor='w',pady=8)
+        refresh()
 
     def _probes_trusted_dialog(self):
         """Opt-in address and cert-pinning registry. Session bearer codes stay in RAM."""
@@ -1489,14 +1550,15 @@ class NetApp(tk.Tk):
             if not ip.startswith('127.') and not messagebox.askyesno(
                 'Разрешить входящие подключения?',
                 f'Разрешить приём ICMP-измерений по TLS на {ip}:{port}? '
-                'Только от компьютера с секретным кодом; отправитель должен проверить отпечаток. '
+                'Только от отправителей с индивидуальными ключами; отправитель должен проверить отпечаток. '
                 'Windows Firewall настраивается отдельно.',parent=self):
                 return
-            server = probe_transport.PeerReceiver(ip, port).start()
+            server = probe_transport.PeerReceiver(ip, port, strict_peers=True,
+                         trusted_peers=self.store.trusted_sender_hashes()).start()
             self.probe_receiver = server
             self.probe_cert.set(server.fingerprint)
-            self.probe_access.set(server.token)
-            self._set_status('Защищённый приём включён только на указанном IPv4. Код действует до отключения.')
+            self.probe_access.set('— личные ключи в списке отправителей —')
+            self._set_status('TLS-приём включён. Только отправители из разрешённого списка.')
         except (ValueError, OSError, RuntimeError) as exc:
             messagebox.showerror('Точки наблюдения', str(exc), parent=self)
 
@@ -1506,7 +1568,7 @@ class NetApp(tk.Tk):
             self.probe_receiver = None
         self.probe_cert.set('')
         self.probe_access.set('')
-        self._set_status('Входящие подключения отключены. Старый код доступа недействителен.')
+        self._set_status('Приём отключён. Личные ключи остаются разрешёнными до отзыва.')
 
     def _probes_send(self):
         if self.probe_send_busy:
@@ -1517,6 +1579,7 @@ class NetApp(tk.Tk):
             port = probe_transport.allowed_port(int(self.probe_peer_port.get()))
             cert = probe_transport.validate_fingerprint(self.probe_peer_cert.get())
             code = probe_transport.validate_token(self.probe_peer_key.get())
+            peer_id = probe_transport.validate_peer_id(self.probe_sender_id.get())
         except (ValueError, OSError) as exc:
             self.probe_auto.set(False)
             messagebox.showwarning('Точки наблюдения', str(exc), parent=self)
@@ -1528,7 +1591,7 @@ class NetApp(tk.Tk):
                            if (p.host,p.port,p.fingerprint)==(host,port,cert)),host)
         def worker():
             try:
-                probe_transport.send_snapshot(host, port, cert, code, snapshot)
+                probe_transport.send_snapshot(host, port, cert, code, snapshot, peer_id=peer_id)
                 self.messages.put(('probe_send_result', True, 'TLS-пакет принят удалённой точкой.',peer_alias,len(snapshot.readings)))
             except Exception:
                 self.messages.put(('probe_send_result', False, 'Обмен не удался: проверьте сеть, TLS и код получателя.'))
@@ -1551,7 +1614,7 @@ class NetApp(tk.Tk):
                     self._set_status('Удалённый пакет отклонён SQLite')
             if imported:
                 self._probes_refresh()
-                self._set_status('TLS-пакет с кодом сеанса получен; имя отправителя не подтверждено.')
+                self._set_status('TLS-пакет получен с личным ключом; имя — ID ключа, не подтверждение ПК.')
         if self.probe_auto.get() and not self.probe_send_busy and time.monotonic()-self.probe_last_auto >= 60:
             self._probes_send()
         note,_ = probe_peers.recent_receive_state(self.store.probe_activities(200),datetime.now(timezone.utc))
