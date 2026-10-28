@@ -24,6 +24,7 @@ from . import map_view
 from . import time_machine
 from . import detective
 from . import detective_timeline
+from . import topology_incidents
 from . import port_health
 from . import fdb
 from . import traffic
@@ -655,6 +656,45 @@ class NetApp(tk.Tk):
                     continue
         return tuple(changes[:20])
 
+    def _detective_history_windows(self):
+        """Two successful captures of same switch, a short trustworthy interval.
+
+        Missing/incomplete captures, wide gaps and stale pairs are ignored.
+        """
+        try:
+            captures = self.store.lldp_captures(100)
+        except (sqlite3.Error, ValueError):
+            return ()
+        now = datetime.now(timezone.utc)
+        by_switch = {}
+        for ident, stamp, switch, _name, _count in captures:
+            try:
+                at = datetime.fromisoformat(stamp)
+                if at.tzinfo is None:
+                    continue
+                age = (now - at.astimezone(timezone.utc)).total_seconds()
+                if not 0 <= age <= 900:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            by_switch.setdefault(switch, []).append((ident, at))
+        result = []
+        for switch, items in sorted(by_switch.items())[:20]:
+            if len(items) < 2:
+                continue
+            newest, prior = items[0], items[1]
+            if not 0 < (newest[1] - prior[1]).total_seconds() <= 300:
+                continue
+            try:
+                changes = tuple(self.store.compare_lldp_captures(prior[0], newest[0]))
+                older_links = tuple(self.store.lldp_capture_neighbors(prior[0]))
+            except (ValueError, sqlite3.Error):
+                continue
+            if changes:
+                result.append(topology_incidents.LldpWindow(switch, prior[1], newest[1],
+                                                              changes[:100], older_links[:512]))
+        return tuple(result)
+
     def _detective_analyze(self):
         now = time.monotonic()
         # Only recent measurements are used; restored inventory is not an observation.
@@ -670,6 +710,9 @@ class NetApp(tk.Tk):
             for ip in sorted(fresh_topology)
             for d in self.port_error_deltas.get(ip, ())[:100])
         events = detective.recent_device_events(self.store.events(250))
+        history_windows = self._detective_history_windows()
+        historical_matches = topology_incidents.correlate_history(
+            events, history_windows, tuple(self.devices.values()))
         obs = detective.Observation(
             gateway=self.gateway or '', availability=latest,
             wifi_connected=(bool(wifi_status.connected)
@@ -684,9 +727,13 @@ class NetApp(tk.Tk):
                                     for d in self.port_error_deltas.get(ip, ())),
             lldp_endpoints=detective_timeline.verified_lldp_endpoints(
                 fresh_topology, tuple(self.devices.values())),
-            timed_port_faults=observed_faults)
+            timed_port_faults=observed_faults,
+            topology_history_matches=historical_matches)
         self._detective_findings = detective.diagnose(obs)
-        self._detective_moments = detective_timeline.timeline(events, observed_faults)
+        self._detective_moments = tuple(sorted(
+            (*detective_timeline.timeline(events, observed_faults),
+             *topology_incidents.history_moments(history_windows)),
+            key=lambda m: (m.observed_at, m.source, m.description))[-60:])
         self.detective_timeline_table.delete(*self.detective_timeline_table.get_children())
         for moment in self._detective_moments:
             self.detective_timeline_table.insert('', 'end', values=(
