@@ -28,6 +28,9 @@ CHECKS: tuple[tuple[str, str], ...] = (
     ("wifi_dhcp", "Wi-Fi and local DHCP read-only behavior verified on Windows"),
     ("security_privacy", "Logs and exports checked for secrets and unexpected network writes"),
     ("release_authenticity", "Installer signer or explicit unsigned distribution notice reviewed"),
+    ("probe_two_real_pcs", "Pinned TLS transfer between separate real Windows PCs"),
+    ("probe_identity_revoke", "Per-sender revocation and unauthorized replay verified on real PCs"),
+    ("probe_outage_recovery", "20-minute outage and recovery measured between two real PCs"),
 )
 
 VALID_STATES = frozenset({"not_run", "pass", "fail", "blocked"})
