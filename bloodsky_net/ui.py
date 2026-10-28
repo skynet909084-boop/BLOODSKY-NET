@@ -23,6 +23,7 @@ from . import topology
 from . import map_view
 from . import time_machine
 from . import detective
+from . import incident_patterns
 from . import detective_timeline
 from . import topology_incidents
 from . import port_health
@@ -119,6 +120,7 @@ class NetApp(tk.Tk):
         self._timeline_last_capture = time.monotonic()
         self._gateway_failures = 0
         self._detective_findings = ()
+        self._detective_health = None
         self._detective_moments = ()
         self._timeline_index: dict[str, int] = {}
         self.timeline_before = tk.StringVar(value='')
@@ -588,7 +590,7 @@ class NetApp(tk.Tk):
         parent = self._new_page('Детектив')
         note = self._panel(parent)
         note.pack(fill='x', pady=(0, 12))
-        self._label(note, 'ПОИСК ВЕРОЯТНЫХ ПРИЧИН · правила v2.1', 15, True, BLUE).pack(
+        self._label(note, 'ПОИСК ВЕРОЯТНЫХ ПРИЧИН · правила v2.3', 15, True, BLUE).pack(
             anchor='w', padx=15, pady=(12, 4))
         self._label(note, 'По кнопке анализирует только имеющиеся свежие ICMP/ARP/Wi-Fi/SNMP '
                     'наблюдения и последние изменения LLDP. Не отправляет данные в облако, '
@@ -729,7 +731,11 @@ class NetApp(tk.Tk):
                 fresh_topology, tuple(self.devices.values())),
             timed_port_faults=observed_faults,
             topology_history_matches=historical_matches)
-        self._detective_findings = detective.diagnose(obs)
+        self._detective_health = incident_patterns.availability_index(latest)
+        # The local journal is bounded; missing history never implies no incidents.
+        history_events = self.store.events(5000)
+        self._detective_findings = (
+            detective.diagnose(obs) + detective.recurrence_findings(history_events, now_utc))
         self._detective_moments = tuple(sorted(
             (*detective_timeline.timeline(events, observed_faults),
              *topology_incidents.history_moments(history_windows)),
@@ -744,11 +750,14 @@ class NetApp(tk.Tk):
             self.detective_table.insert('', 'end', iid=str(n),
                 values=({'warning':'Предупреждение','notice':'Внимание','info':'Информация'}[f.severity],
                         f.confidence, f.title), tags=(f.severity,))
-        self.detective_note.configure(text=f'Результатов: {len(self._detective_findings)} · '
+        health = self._detective_health
+        icmp_text = ('— (мало измерений)' if health.score is None else f'{health.score}/100')
+        self.detective_note.configure(text=f'Индекс ответов ICMP: {icmp_text} · Результатов: {len(self._detective_findings)} · '
             f'свежих ICMP: {len(latest)} · ошибок SNMP: {len(self.topology_failed)} · '
             'выводы проверяемы, не являются доказательствами поломки')
-        self.detective_table.selection_set('0')
-        self._detective_select()
+        if self._detective_findings:
+            self.detective_table.selection_set('0')
+            self._detective_select()
 
     def _detective_select(self, _event=None):
         selection = self.detective_table.selection()
@@ -777,7 +786,7 @@ class NetApp(tk.Tk):
             return
         try:
             with open(filename, 'w', encoding='utf-8') as fp:
-                json.dump(detective.export_report(self._detective_findings, self._detective_moments), fp, ensure_ascii=False, indent=2)
+                json.dump(detective.export_report(self._detective_findings, self._detective_moments, self._detective_health), fp, ensure_ascii=False, indent=2)
             self._set_status('DETECTIVE: отчёт записан локально')
         except OSError:
             messagebox.showerror('Детектив', 'Не удалось сохранить отчёт.', parent=self)
@@ -793,7 +802,7 @@ class NetApp(tk.Tk):
             return
         try:
             with open(filename, 'w', encoding='utf-8') as fp:
-                fp.write(detective.export_html_report(self._detective_findings, self._detective_moments))
+                fp.write(detective.export_html_report(self._detective_findings, self._detective_moments, self._detective_health))
             self._set_status('DETECTIVE: HTML-отчёт записан локально')
         except OSError:
             messagebox.showerror('Детектив', 'Не удалось сохранить отчёт.', parent=self)

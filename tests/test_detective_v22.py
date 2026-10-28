@@ -114,7 +114,7 @@ class HistoricalLinkTests(unittest.TestCase):
         self.assertIn('уникальный MAC', item.evidence[1].observation)
         self.assertLessEqual(len(triage_steps(findings)), 8)
         structured = export_report(findings, history_moments((window(),)))
-        self.assertEqual(structured['engine'], 'DETECTIVE rules v2.2')
+        self.assertEqual(structured['engine'], 'DETECTIVE rules v2.3')
         self.assertTrue(structured['recommended_checks'])
         self.assertTrue(structured['timeline'])
         self.assertTrue(json.dumps(structured, ensure_ascii=False))
