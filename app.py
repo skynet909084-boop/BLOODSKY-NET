@@ -19,7 +19,7 @@ def main():
     if os.name != "nt" and not os.environ.get("BLOODSKY_ALLOW_NONWINDOWS"):
         print("BLOODSKY NET предназначен для Windows 10/11. Для запуска демо на Linux установите BLOODSKY_ALLOW_NONWINDOWS=1.")
         return 1
-    from bloodsky_net.ui import NetApp
+    from bloodsky_net.ui_easy import NetApp
     app = NetApp()
     app.mainloop()
     return 0
