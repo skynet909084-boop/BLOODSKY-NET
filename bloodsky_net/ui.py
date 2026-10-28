@@ -25,6 +25,7 @@ from . import distributed_probes as probes
 from . import probe_transport
 from . import probe_peers
 from . import probe_recovery
+from . import probe_quality
 from . import wifi_survey
 from . import wifi_survey_compare
 from . import wifi_survey_audit
@@ -1373,6 +1374,7 @@ class NetApp(tk.Tk):
         self._button(actions, 'Доверенные получатели', self._probes_trusted_dialog).pack(side='left')
         self._button(actions, 'Разрешённые отправители', self._probes_senders_dialog).pack(side='left', padx=8)
         self._button(actions, 'Журнал измерений', self._probes_activity_dialog).pack(side='left', padx=8)
+        self._button(actions, 'Качество TLS', self._probes_quality_dialog).pack(side='left', padx=8)
         self._button(actions, 'Статус отправителей', self._probes_sender_states).pack(side='left', padx=8)
         self.probes_activity_note = self._label(actions, 'Входящих измерений пока нет', 9, color=MUTED)
         self.probes_activity_note.pack(side='left', padx=7)
@@ -1571,6 +1573,30 @@ class NetApp(tk.Tk):
         self._label(panel, 'Отсутствие новых пакетов не подтверждает отключение компьютера.',
                     9, color=MUTED).pack(anchor='w', pady=8)
 
+    def _probes_quality_dialog(self):
+        dialog=tk.Toplevel(self)
+        dialog.title('Качество TLS-передач · не статус сети')
+        dialog.geometry('940x520')
+        dialog.configure(bg=BG)
+        panel=self._panel(dialog)
+        panel.pack(fill='both',expand=True,padx=12,pady=12)
+        self._label(panel,'ЛОКАЛЬНЫЕ ПОПЫТКИ ЗА 7 ДНЕЙ · ЗАДЕРЖКА ЗАПРОСА, НЕ PING',
+                    10,True,BLUE).pack(anchor='w',pady=(0,8))
+        frame,table=self._tree(panel,
+            ('Получатель','Принято / попыток','Ошибки сети','TLS/доступ','Медиана / p95, мс','Пауза, мин'),
+            (150,145,130,130,175,115))
+        frame.pack(fill='both',expand=True)
+        for s in probe_quality.summarize(self.store.probe_transfer_attempts(2048),datetime.now(timezone.utc)):
+            timing=(f'{s.median_ms} / {s.p95_ms}' if s.median_ms is not None else 'недостаточно данных')
+            table.insert('','end',values=(s.destination,f'{s.accepted} / {s.total}',
+                s.network_failures,s.security_failures,timing,
+                s.longest_unobserved_gap_minutes if s.longest_unobserved_gap_minutes is not None else '—'))
+        self._label(panel,'Принято после ошибки = подтверждена одна последующая отправка; '
+                    'не доказано, что сеть была непрерывно недоступна. '
+                    'Пауза между попытками не является простоем удалённого ПК. '
+                    'Время запроса включает TLS и ответ, не является ICMP задержкой.',
+                    9,color=MUTED,wraplength=850,justify='left').pack(anchor='w',pady=10)
+
     def _probes_activity_dialog(self):
         dialog=tk.Toplevel(self)
         dialog.title('Журнал обмена измерениями · UTC')
@@ -1650,13 +1676,18 @@ class NetApp(tk.Tk):
         peer_alias = next((p.alias for p in self.store.trusted_destinations()
                            if (p.host,p.port,p.fingerprint)==(host,port,cert)),host)
         def worker():
+            started=time.monotonic()
             try:
                 probe_transport.send_snapshot(host, port, cert, code, snapshot, peer_id=peer_id)
-                self.messages.put(('probe_send_result', True, 'TLS-пакет принят удалённой точкой.',peer_alias,len(snapshot.readings)))
+                elapsed=min(60000,max(0,int(1000*(time.monotonic()-started))))
+                self.messages.put(('probe_send_result', True, 'TLS-пакет принят удалённой точкой.',
+                                   peer_alias,len(snapshot.readings),'accepted',elapsed))
             except Exception as exc:
                 kind=probe_recovery.failure_kind(exc)
+                elapsed=min(60000,max(0,int(1000*(time.monotonic()-started))))
                 self.messages.put(('probe_send_result', False,
-                    'Обмен не удался: проверьте сеть, TLS и разрешение получателя.',kind))
+                    'Обмен не удался: проверьте сеть, TLS и разрешение получателя.',
+                    kind,peer_alias,elapsed))
         threading.Thread(target=worker, daemon=True, name='BloodskyProbeSend').start()
 
     def _probes_network_tick(self):
@@ -2065,6 +2096,17 @@ class NetApp(tk.Tk):
                             self.probe_retry,item[3],time.monotonic())
                         if self.probe_retry.blocked:
                             self.probe_auto.set(False)
+                    # Only completion metadata is persisted, never the TLS secret or payload.
+                    try:
+                        outcome=('accepted' if item[1] else
+                                 'network' if item[3]=='transient' else
+                                 'tls' if item[3]=='tls_identity' else 'rejected')
+                        name=item[3] if item[1] else item[4]
+                        elapsed=item[6] if item[1] else item[5]
+                        self.store.record_probe_transfer(probe_quality.TransferAttempt(
+                            datetime.now(timezone.utc),name,outcome,elapsed))
+                    except (ValueError,sqlite3.Error,IndexError,TypeError):
+                        pass  # A diagnostics write failure cannot corrupt a TLS result.
                     self._set_status(item[2] + (' ' + self.probe_retry.reason if not item[1] else ''))
                 elif kind == "tray_show":
                     self.show_window()

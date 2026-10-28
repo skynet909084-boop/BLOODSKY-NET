@@ -101,6 +101,11 @@ class Storage:
         # Persistent allowlist contains only hashes of 256-bit random codes.
         self.db.execute("""CREATE TABLE IF NOT EXISTS probe_trusted_senders (
             peer_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL)""")
+        # Local transport diagnostics (no secret, packet body, or certificate stored).
+        self.db.execute("""CREATE TABLE IF NOT EXISTS probe_transfer_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, destination TEXT NOT NULL,
+            outcome TEXT NOT NULL, elapsed_ms INTEGER NOT NULL)""")
+        self.db.execute('CREATE INDEX IF NOT EXISTS idx_probe_transfer_ts ON probe_transfer_attempts(ts)')
         self.db.commit()
         self._wifi_writes = 0
         self._port_writes = 0
@@ -578,6 +583,34 @@ class Storage:
             except (TypeError,ValueError):
                 continue
         return tuple(result)
+
+    def record_probe_transfer(self, attempt):
+        """Bounded local attempt history; call on the Tk/main database thread only."""
+        from .probe_quality import validate_attempt, MAX_HISTORY
+        validated=validate_attempt(attempt)
+        stamp=validated.at.astimezone(__import__('datetime').timezone.utc).isoformat()
+        with self.db:
+            self.db.execute('INSERT INTO probe_transfer_attempts(ts,destination,outcome,elapsed_ms) '
+                            'VALUES(?,?,?,?)', (stamp,validated.destination,
+                            validated.outcome,validated.elapsed_ms))
+            self.db.execute("DELETE FROM probe_transfer_attempts WHERE datetime(ts) < datetime('now','-7 days')")
+            self.db.execute('DELETE FROM probe_transfer_attempts WHERE id NOT IN '
+                            '(SELECT id FROM probe_transfer_attempts ORDER BY id DESC LIMIT ?)',
+                            (MAX_HISTORY,))
+
+    def probe_transfer_attempts(self, limit: int = 512):
+        from datetime import datetime
+        from .probe_quality import TransferAttempt, validate_attempt, MAX_HISTORY
+        n=max(1,min(MAX_HISTORY,int(limit)))
+        rows=self.db.execute('SELECT ts,destination,outcome,elapsed_ms FROM probe_transfer_attempts '
+                             'ORDER BY id DESC LIMIT ?', (n,)).fetchall()
+        output=[]
+        for ts,dest,outcome,elapsed in rows:
+            try:
+                output.append(validate_attempt(TransferAttempt(datetime.fromisoformat(ts),dest,outcome,elapsed)))
+            except (ValueError,TypeError):
+                continue
+        return tuple(reversed(output))
 
     def close(self):
         self.db.close()
