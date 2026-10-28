@@ -26,6 +26,7 @@ from . import probe_transport
 from . import probe_peers
 from . import probe_recovery
 from . import probe_quality
+from . import probe_stability
 from . import wifi_survey
 from . import wifi_survey_compare
 from . import wifi_survey_audit
@@ -1576,7 +1577,7 @@ class NetApp(tk.Tk):
     def _probes_quality_dialog(self):
         dialog=tk.Toplevel(self)
         dialog.title('Качество TLS-передач · не статус сети')
-        dialog.geometry('940x520')
+        dialog.geometry('990x730')
         dialog.configure(bg=BG)
         panel=self._panel(dialog)
         panel.pack(fill='both',expand=True,padx=12,pady=12)
@@ -1591,6 +1592,30 @@ class NetApp(tk.Tk):
             table.insert('','end',values=(s.destination,f'{s.accepted} / {s.total}',
                 s.network_failures,s.security_failures,timing,
                 s.longest_unobserved_gap_minutes if s.longest_unobserved_gap_minutes is not None else '—'))
+        self._label(panel,'ПОВТОРНЫЕ СБОИ · ТОЛЬКО НАБЛЮДАЕМЫЕ ПОПЫТКИ',10,True,BLUE).pack(anchor='w',pady=(10,4))
+        burstframe,bursttable=self._tree(panel,('Получатель','UTC','Тип наблюдения','Попыток'),(180,230,390,90))
+        burstframe.pack(fill='x')
+        bursttable.configure(height=5)
+        attempts=self.store.probe_transfer_attempts(2048)
+        for pattern in probe_stability.patterns(attempts,datetime.now(timezone.utc))[:16]:
+            names={'security_stop':'TLS/авторизация: стоп',
+                   'repeated_network_error':'Серия сетевых ошибок',
+                   'accepted_after_errors':'Приём после ошибок'}
+            bursttable.insert('','end',values=(pattern.destination,
+                pattern.last_at.isoformat(timespec='seconds'),
+                names.get(pattern.kind,pattern.kind),pattern.attempts))
+        def export_stability():
+            path=filedialog.asksaveasfilename(title='Отчёт по попыткам TLS (содержит имена получателей)',
+                defaultextension='.json',filetypes=[('JSON','*.json')],parent=dialog)
+            if not path:return
+            try:
+                with open(path,'w',encoding='utf-8') as f:
+                    json.dump(probe_stability.report(attempts,datetime.now(timezone.utc)),f,
+                              ensure_ascii=False,indent=2)
+                self._set_status('Локальный отчёт по TLS-попыткам сохранён')
+            except OSError:
+                messagebox.showerror('Качество TLS','Не удалось сохранить отчёт.',parent=dialog)
+        self._button(panel,'Экспорт анализа JSON',export_stability).pack(anchor='e',pady=(4,0))
         self._label(panel,'Принято после ошибки = подтверждена одна последующая отправка; '
                     'не доказано, что сеть была непрерывно недоступна. '
                     'Пауза между попытками не является простоем удалённого ПК. '
