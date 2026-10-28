@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import ipaddress
+import math
 from .network import Device, now_iso
 
 
@@ -26,8 +28,18 @@ class Storage:
         self.db.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, severity TEXT NOT NULL, title TEXT NOT NULL, detail TEXT NOT NULL)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
         self.db.execute("CREATE TABLE IF NOT EXISTS wifi_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, connected INTEGER NOT NULL, ssid TEXT NOT NULL, bssid TEXT NOT NULL, signal INTEGER NOT NULL, channel INTEGER NOT NULL)")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS port_traffic (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                switch_ip TEXT NOT NULL,
+                if_index INTEGER NOT NULL,
+                if_name TEXT NOT NULL,
+                inbound_mbps REAL NOT NULL,
+                outbound_mbps REAL NOT NULL)""")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_port_traffic_device ON port_traffic(switch_ip, if_index, id)")
         self.db.commit()
         self._wifi_writes = 0
+        self._port_writes = 0
 
     def save_device(self, device: Device):
         self.db.execute("INSERT INTO devices(ip, payload) VALUES (?, ?) ON CONFLICT(ip) DO UPDATE SET payload=excluded.payload",
@@ -83,6 +95,52 @@ class Storage:
         count = max(1, min(int(limit), 1000))
         rows = self.db.execute("SELECT connected, signal FROM wifi_samples ORDER BY id DESC LIMIT ?", (count,)).fetchall()
         return [float(signal) if connected else None for connected, signal in reversed(rows)]
+
+    def save_port_rates(self, switch_ip: str, rates, ts: str | None = None) -> int:
+        """Persist bounded, measured port speeds only (no SNMP credentials).
+
+        Missing/invalid measurements must never be interpreted as 0 Mbps.
+        A single snapshot is capped at 256 interfaces, history at 100000 rows
+        and seven days (pruned on each 10th non-empty polling cycle).
+        """
+        try:
+            address = ipaddress.ip_address(switch_ip)
+            if not isinstance(address, ipaddress.IPv4Address) or not address.is_private:
+                return 0
+        except ValueError:
+            return 0
+        entries = []
+        for idx, rate in sorted(rates.items())[:256]:
+            received, sent = rate.inbound_mbps, rate.outbound_mbps
+            if (not isinstance(idx, int) or idx < 1 or idx > 2147483647 or
+                    received is None or sent is None or
+                    not all(isinstance(v, (float, int)) and math.isfinite(v) and 0 <= v <= 1e7
+                            for v in (received, sent))):
+                continue
+            entries.append((ts or now_iso(), switch_ip, idx, str(rate.name)[:100],
+                            float(received), float(sent)))
+        if not entries:
+            return 0
+        self.db.executemany("INSERT INTO port_traffic(ts, switch_ip, if_index, if_name, inbound_mbps, outbound_mbps) "
+                            "VALUES (?, ?, ?, ?, ?, ?)", entries)
+        self._port_writes += 1
+        if self._port_writes % 10 == 0:
+            self.db.execute("DELETE FROM port_traffic WHERE datetime(ts) < datetime('now', '-7 days')")
+            self.db.execute("DELETE FROM port_traffic WHERE id NOT IN "
+                            "(SELECT id FROM port_traffic ORDER BY id DESC LIMIT 100000)")
+        self.db.commit()
+        return len(entries)
+
+    def port_history(self, switch_ip: str, if_index: int, limit: int = 120):
+        """Chronological samples for a known device/interface only."""
+        if not 1 <= int(if_index) <= 2147483647:
+            return []
+        length = max(1, min(int(limit), 720))
+        rows = self.db.execute(
+            "SELECT ts, inbound_mbps, outbound_mbps FROM port_traffic "
+            "WHERE switch_ip = ? AND if_index = ? ORDER BY id DESC LIMIT ?",
+            (switch_ip, if_index, length)).fetchall()
+        return list(reversed(rows))
 
     def close(self):
         self.db.close()
