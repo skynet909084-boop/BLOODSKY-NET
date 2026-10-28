@@ -1,5 +1,5 @@
 ﻿#define MyAppName "BLOODSKY NET"
-#define MyAppVersion "0.11.0-dev"
+#define MyAppVersion "0.12.0-dev"
 #define MyAppExeName "BLOODSKY-NET.exe"
 
 [Setup]
@@ -16,7 +16,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 DisableWelcomePage=no
 WizardStyle=modern
 OutputDir=output
-OutputBaseFilename=BLOODSKY-NET-Setup-0.11.0-dev
+OutputBaseFilename=BLOODSKY-NET-Setup-0.12.0-dev
 Compression=lzma
 SolidCompression=yes
 CloseApplications=yes
