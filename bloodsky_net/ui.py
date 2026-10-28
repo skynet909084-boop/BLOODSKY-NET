@@ -892,6 +892,22 @@ class NetApp(tk.Tk):
                  insertbackground=TEXT, relief='flat', width=18, font=('Segoe UI', 10)).pack(side='left', padx=(5, 8), ipady=6)
         entry.bind('<Return>', lambda _e: self._wifi_survey_refresh())
         self._button(bar, 'Показать этаж', self._wifi_survey_refresh).pack(side='left')
+        self.survey_phase = tk.StringVar(value='До')
+        phasebar = tk.Frame(parent, bg=BG)
+        phasebar.pack(fill='x', pady=(0, 7))
+        self._label(phasebar, 'Этап измерения:', 10, color=MUTED).pack(side='left')
+        ttk.Combobox(phasebar, textvariable=self.survey_phase, state='readonly',
+                     values=('До', 'После'), width=11, style='Night.TCombobox').pack(side='left', padx=8)
+        self._label(phasebar, 'Масштаб:', 10, color=MUTED).pack(side='left', padx=(16, 4))
+        self.survey_zoom = tk.StringVar(value='100%')
+        zoom_box = ttk.Combobox(phasebar, textvariable=self.survey_zoom, state='readonly',
+                                values=('75%', '100%', '125%', '150%', '200%'), width=7, style='Night.TCombobox')
+        zoom_box.pack(side='left', padx=6)
+        zoom_box.bind('<<ComboboxSelected>>', lambda _e: self._wifi_survey_draw())
+        self._survey_pan_x = self._survey_pan_y = 0.0
+        self._survey_pan_anchor = None
+        self._button(phasebar, 'Сбросить вид', self._wifi_survey_reset_view).pack(side='left', padx=10)
+        self._label(phasebar, 'Shift + перетаскивание — сдвинуть план', 9, color=MUTED).pack(side='left')
         planbar = tk.Frame(parent, bg=BG)
         planbar.pack(fill='x', pady=(0, 7))
         self._button(planbar, 'Загрузить план PNG/JPEG', self._wifi_survey_load_plan).pack(side='left')
@@ -909,15 +925,57 @@ class NetApp(tk.Tk):
         self.survey_canvas.pack(fill='x', pady=(0, 9))
         self.survey_canvas.bind('<Button-1>', self._wifi_survey_click)
         self.survey_canvas.bind('<Configure>', lambda _e: self._wifi_survey_draw())
+        self.survey_canvas.bind('<Shift-ButtonPress-1>', self._wifi_survey_pan_start)
+        self.survey_canvas.bind('<Shift-B1-Motion>', self._wifi_survey_pan_move)
+        self.survey_canvas.bind('<Shift-ButtonRelease-1>', self._wifi_survey_pan_stop)
         self._label(parent, 'СРАВНЕНИЕ КОМНАТ НА ЭТАЖЕ (WINDOWS %, НЕ dBm)', 10, True, BLUE).pack(anchor='w', pady=(4, 5))
         frame, self.survey_stats = self._tree(parent,
             ('Комната', 'Замеров', 'Средний', 'Минимум', 'Максимум', 'BSSID'), (200, 105, 130, 110, 115, 105))
         frame.pack(fill='both', expand=True)
-        self.survey_stats.configure(height=5)
+        self.survey_stats.configure(height=4)
+        self.survey_stats.tag_configure('low', foreground=RED)
+        self.survey_stats.tag_configure('moderate', foreground=YELLOW)
+        self.survey_stats.tag_configure('observed_good', foreground=GREEN)
+        self.survey_stats.tag_configure('insufficient', foreground=MUTED)
+        self._label(parent, 'ДО / ПОСЛЕ — ТОЛЬКО ЯВНО ОТМЕЧЕННЫЕ ЗАМЕРЫ ОДНОГО SSID',
+                    10, True, BLUE).pack(anchor='w', pady=(8, 5))
+        cframe, self.survey_comparison = self._tree(parent,
+            ('Комната', 'SSID', 'До (n)', 'После (n)', 'Разница'), (180, 210, 160, 160, 125))
+        cframe.pack(fill='x')
+        self.survey_comparison.configure(height=3)
         self._label(parent, 'Цвет точек: красный <45%, жёлтый 45–69%, зелёный ≥70%. '
                     'Комнаты — метки пользователя; границы комнат не определяются автоматически. '
-                    'История не передаётся в облако, экспорт содержит SSID/BSSID.',
+                    'В сравнении требуется ≥2 замера на каждом этапе; разные SSID не смешиваются. ' 
+                    'Проценты Windows не доказывают улучшение скорости; экспорт содержит SSID/BSSID.',
                     9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', pady=(8, 0))
+
+    def _wifi_survey_bounds(self, w, h, plan):
+        zoom = int(self.survey_zoom.get().rstrip('%'))
+        width, height = ((plan.width, plan.height) if plan else (w, h))
+        return wifi_floorplan.zoomed_bounds(w, h, width, height, zoom,
+            self._survey_pan_x, self._survey_pan_y)
+
+    def _wifi_survey_reset_view(self):
+        self._survey_pan_x = self._survey_pan_y = 0.0
+        self.survey_zoom.set('100%')
+        self._wifi_survey_draw()
+
+    def _wifi_survey_pan_start(self, event):
+        self._survey_pan_anchor = (event.x, event.y)
+        return 'break'
+
+    def _wifi_survey_pan_move(self, event):
+        if self._survey_pan_anchor is not None:
+            ax, ay = self._survey_pan_anchor
+            self._survey_pan_x += event.x-ax
+            self._survey_pan_y += event.y-ay
+            self._survey_pan_anchor = (event.x, event.y)
+            self._wifi_survey_draw()
+        return 'break'
+
+    def _wifi_survey_pan_stop(self, _event):
+        self._survey_pan_anchor = None
+        return 'break'
 
     def _wifi_survey_click(self, event):
         """Capture a manual location only from a fresh, measured connected WLAN."""
@@ -933,8 +991,7 @@ class NetApp(tk.Tk):
             return
         self._wifi_survey_load_current_plan()
         plan = self._survey_plan
-        bounds = (wifi_floorplan.image_bounds(width, height, plan.width, plan.height) if plan
-                  else (0., 0., float(width), float(height)))
+        bounds = self._wifi_survey_bounds(width, height, plan)
         xy = wifi_floorplan.canvas_to_percent(event.x, event.y, bounds)
         if xy is None:
             self.survey_note.configure(text='Точка вне плана. Нажмите внутри изображения помещения.')
@@ -942,12 +999,12 @@ class NetApp(tk.Tk):
         try:
             self.store.save_wifi_survey_point(
                 zone, xy[0], xy[1], state.ssid, state.bssid, state.signal, state.channel,
-                room=self.survey_room.get())
+                room=self.survey_room.get(), phase=self.survey_phase.get())
         except (ValueError, sqlite3.Error) as exc:
             self.survey_note.configure(text=f'Замер не сохранён: {str(exc)[:170]}')
             return
         self._wifi_survey_refresh()
-        self.survey_note.configure(text=f'Сохранён замер: {zone} / {self.survey_room.get().strip()} · {state.ssid} · {state.signal}% · {state.bssid}')
+        self.survey_note.configure(text=f'Сохранён замер: {zone} / {self.survey_room.get().strip()} · {self.survey_phase.get()} · {state.ssid} · {state.signal}% · {state.bssid}')
 
     def _wifi_survey_refresh(self):
         try:
@@ -959,7 +1016,13 @@ class NetApp(tk.Tk):
         self.survey_stats.delete(*self.survey_stats.get_children())
         for z in wifi_survey.room_quality(points, self.survey_zone.get().strip()):
             self.survey_stats.insert('', 'end', values=(z.zone, z.samples, f'{z.mean_signal:.1f}%',
-                                                      f'{z.min_signal}%', f'{z.max_signal}%', z.distinct_bssids))
+                                                      f'{z.min_signal}%', f'{z.max_signal}%', z.distinct_bssids),
+                                     tags=(wifi_survey.room_signal_status(z),))
+        self.survey_comparison.delete(*self.survey_comparison.get_children())
+        for c in wifi_survey.compare_phases(points, self.survey_zone.get().strip()):
+            self.survey_comparison.insert('', 'end', values=(c.room, c.ssid[:35],
+                f'{c.before_mean:.1f}% ({c.before_samples})',
+                f'{c.after_mean:.1f}% ({c.after_samples})', f'{c.delta:+.1f} п.п.'))
         self.survey_note.configure(text=f'Замеров на этом этаже: {len(self._survey_visible_points)} · '
             f'всего: {len(points)}. Укажите комнату и нажмите на место замера; BSSID берётся из Windows.')
         self._wifi_survey_load_current_plan()
@@ -1018,12 +1081,12 @@ class NetApp(tk.Tk):
         w, h = max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
         plan = getattr(self, '_survey_plan', None)
         if plan:
-            bounds = wifi_floorplan.image_bounds(w, h, plan.width, plan.height)
+            bounds = self._wifi_survey_bounds(w, h, plan)
             try:
                 from io import BytesIO
                 from PIL import Image, ImageTk
                 image = Image.open(BytesIO(plan.jpeg))
-                image.thumbnail((max(1, round(bounds[2])), max(1, round(bounds[3]))), Image.Resampling.LANCZOS)
+                image = image.resize((max(1, round(bounds[2])), max(1, round(bounds[3]))), Image.Resampling.LANCZOS)
                 self._survey_photo = ImageTk.PhotoImage(image, master=self)
                 canvas.create_image(bounds[0], bounds[1], image=self._survey_photo, anchor='nw')
             except (OSError, ValueError, ImportError, tk.TclError):
@@ -1031,11 +1094,11 @@ class NetApp(tk.Tk):
                 return
         else:
             self._survey_photo = None
-            bounds = (0., 0., float(w), float(h))
+            bounds = self._wifi_survey_bounds(w, h, None)
             for n in range(1, 10):
-                x = w*n/10; y = h*n/10
-                canvas.create_line(x, 0, x, h, fill=BORDER)
-                canvas.create_line(0, y, w, y, fill=BORDER)
+                x = bounds[0] + bounds[2]*n/10; y = bounds[1] + bounds[3]*n/10
+                canvas.create_line(x, bounds[1], x, bounds[1]+bounds[3], fill=BORDER)
+                canvas.create_line(bounds[0], y, bounds[0]+bounds[2], y, fill=BORDER)
         for point in getattr(self, '_survey_visible_points', ()):
             x, y = wifi_floorplan.percent_to_canvas(point.x, point.y, bounds)
             canvas.create_oval(x-7, y-7, x+7, y+7,
@@ -1060,10 +1123,10 @@ class NetApp(tk.Tk):
         try:
             with open(filename,'w',newline='',encoding='utf-8-sig') as fp:
                 writer=csv.writer(fp)
-                writer.writerow(('UTC','floor','room','x_percent','y_percent','SSID','BSSID','signal_windows_percent','channel'))
+                writer.writerow(('UTC','floor','room','phase','x_percent','y_percent','SSID','BSSID','signal_windows_percent','channel'))
                 for p in points:
                     writer.writerow((p.observed_at,wifi_survey.spreadsheet_safe(p.zone),
-                                     wifi_survey.spreadsheet_safe(p.room),p.x,p.y,
+                                     wifi_survey.spreadsheet_safe(p.room),p.phase,p.x,p.y,
                                      wifi_survey.spreadsheet_safe(p.ssid),p.bssid,p.signal,p.channel))
             self._set_status(f'Wi-Fi RADAR: экспортировано {len(points)} точек')
         except OSError:
