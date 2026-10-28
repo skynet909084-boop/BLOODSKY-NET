@@ -46,6 +46,8 @@ class Storage:
             self.db.execute("ALTER TABLE wifi_survey ADD COLUMN room TEXT NOT NULL DEFAULT 'Без комнаты'")
         if 'phase' not in {r[1] for r in self.db.execute('PRAGMA table_info(wifi_survey)')}:
             self.db.execute("ALTER TABLE wifi_survey ADD COLUMN phase TEXT NOT NULL DEFAULT 'Без этапа'")
+        if 'series' not in {r[1] for r in self.db.execute('PRAGMA table_info(wifi_survey)')}:
+            self.db.execute("ALTER TABLE wifi_survey ADD COLUMN series TEXT NOT NULL DEFAULT 'Без серии'")
         self.db.execute("""CREATE TABLE IF NOT EXISTS wifi_floorplans (
             zone TEXT PRIMARY KEY, image BLOB NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL)""")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_wifi_survey_ts ON wifi_survey(ts)")
@@ -166,15 +168,16 @@ class Storage:
 
     def save_wifi_survey_point(self, zone: str, x: float, y: float, ssid: str,
                                bssid: str, signal: int, channel: int,
-                               ts: str | None = None, room: str = 'Без комнаты', phase: str = 'Без этапа'):
+                               ts: str | None = None, room: str = 'Без комнаты', phase: str = 'Без этапа',
+                               series: str = 'Без серии'):
         """Save an explicit manual survey; never read or persist WLAN credentials."""
         from .wifi_survey import validate_point, MAX_POINTS
-        point = validate_point(zone, x, y, ssid, bssid, signal, channel, ts or now_iso(), room=room, phase=phase)
+        point = validate_point(zone, x, y, ssid, bssid, signal, channel, ts or now_iso(), room=room, phase=phase, series=series)
         with self.db:
             self.db.execute("""INSERT INTO wifi_survey
-                (ts, zone, x, y, ssid, bssid, signal, channel, room, phase) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ts, zone, x, y, ssid, bssid, signal, channel, room, phase, series) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (point.observed_at, point.zone, point.x, point.y, point.ssid,
-                 point.bssid, point.signal, point.channel, point.room, point.phase))
+                 point.bssid, point.signal, point.channel, point.room, point.phase, point.series))
             self.db.execute("DELETE FROM wifi_survey WHERE datetime(ts) < datetime('now', '-30 days')")
             self.db.execute("DELETE FROM wifi_survey WHERE id NOT IN (SELECT id FROM wifi_survey ORDER BY id DESC LIMIT ?)",
                             (MAX_POINTS,))
@@ -184,10 +187,10 @@ class Storage:
         """Bounded, chronological survey records; only manually captured points."""
         from .wifi_survey import SurveyPoint, MAX_POINTS
         if zone is None:
-            rows = self.db.execute("""SELECT ts, zone, x, y, ssid, bssid, signal, channel, room, phase
+            rows = self.db.execute("""SELECT ts, zone, x, y, ssid, bssid, signal, channel, room, phase, series
                                     FROM wifi_survey ORDER BY id DESC LIMIT ?""", (MAX_POINTS,)).fetchall()
         else:
-            rows = self.db.execute("""SELECT ts, zone, x, y, ssid, bssid, signal, channel, room, phase
+            rows = self.db.execute("""SELECT ts, zone, x, y, ssid, bssid, signal, channel, room, phase, series
                                     FROM wifi_survey WHERE zone=? ORDER BY id DESC LIMIT ?""",
                                    (zone, MAX_POINTS)).fetchall()
         return tuple(SurveyPoint(*r) for r in reversed(rows))
