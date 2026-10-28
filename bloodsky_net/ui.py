@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict
 import ipaddress
+import sys
 import math
 import queue
 import socket
@@ -20,6 +21,8 @@ from . import fdb
 from . import traffic
 from . import notifications
 from . import dhcp
+from . import windows_integration
+from .tray import TrayController
 from .storage import Storage
 
 BG = "#0B1220"
@@ -42,7 +45,7 @@ class NetApp(tk.Tk):
         self.geometry("1380x860")
         self.minsize(980, 640)
         self.configure(bg=BG)
-        self.protocol("WM_DELETE_WINDOW", self.shutdown)
+        self.protocol("WM_DELETE_WINDOW", self.close_window)
         self.store = Storage()
         self.devices: dict[str, net.Device] = self.store.load_devices()
         self.topology_snapshots: dict[str, topology.TopologySnapshot] = {}
@@ -61,11 +64,15 @@ class NetApp(tk.Tk):
         self.monitor_stop = threading.Event()
         self.scanning = False
         self.monitoring = False
+        self.monitor_thread: threading.Thread | None = None
+        self.monitor_restart_at = 0.0
+        self.monitor_failures = 0
+        self.tray: TrayController | None = None
         self.gateway, route_ip = net.default_gateway()
         self.local_route_ip = route_ip
         self.adapters = net.get_adapters()
         self.network_value = tk.StringVar(value=net.suggested_network(self.adapters, route_ip))
-        self.monitor_enabled = tk.BooleanVar(value=True)
+        self.monitor_enabled = tk.BooleanVar(value=self.store.get_preference("monitor_enabled", True))
         self.interval_value = tk.StringVar(value="5")
         self.current_page = "Обзор"
         self.monitor_interval = 5
@@ -78,8 +85,10 @@ class NetApp(tk.Tk):
         self.mac_history = net.MacHistory()
         self.ip_alerts: dict[str, net.MacChange] = {}
         self.ip_alert_expiry: dict[str, float] = {}
-        self.alerts_enabled = tk.BooleanVar(value=True)
-        self.windows_alerts_enabled = tk.BooleanVar(value=False)  # explicit opt-in
+        self.alerts_enabled = tk.BooleanVar(value=self.store.get_preference("alerts_enabled", True))
+        self.windows_alerts_enabled = tk.BooleanVar(value=self.store.get_preference("windows_alerts_enabled", False))
+        self.minimize_to_tray = tk.BooleanVar(value=self.store.get_preference("minimize_to_tray", False))
+        self.autostart_enabled = tk.BooleanVar(value=windows_integration.is_autostart_enabled())
         self.alert_last: dict[tuple[str, str, str], float] = {}
         self.alert_token = 0
         self.wifi_last_saved = float('-inf')
@@ -96,7 +105,13 @@ class NetApp(tk.Tk):
         self.after(150, self._drain)
         self.after(1100, self._traffic_tick)
         self.after(1000, self._snmp_tick)
+        self.after(2500, self._monitor_guard)
         self._read_wifi_background()
+        self._setup_tray()
+        if self.monitor_enabled.get() and (self.devices or self.gateway):
+            self._start_monitor()
+        if "--minimized" in sys.argv and self.tray and self.tray.active:
+            self.withdraw()
 
     def _style(self):
         style = ttk.Style(self)
@@ -417,12 +432,28 @@ class NetApp(tk.Tk):
         self._label(parent, "Все изменения состояний и предупреждения сохраняются в локальной базе SQLite.",
                     10, color=MUTED).pack(anchor="w", pady=(0, 12))
         tk.Checkbutton(parent, text="Показывать предупреждения внутри окна", variable=self.alerts_enabled,
+                       command=lambda: self._save_preference("alerts_enabled", self.alerts_enabled),
                        bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
                        activeforeground=TEXT, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 8))
         tk.Checkbutton(parent, text="Уведомления Windows (по умолчанию выключены)",
-                       variable=self.windows_alerts_enabled, bg=BG, fg=TEXT,
+                       variable=self.windows_alerts_enabled,
+                       command=lambda: self._save_preference("windows_alerts_enabled", self.windows_alerts_enabled), bg=BG, fg=TEXT,
                        selectcolor=PANEL, activebackground=BG, activeforeground=TEXT,
                        font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 8))
+        self._label(parent, "Работа в фоне (Windows, только текущий пользователь)",
+                    11, True, BLUE).pack(anchor="w", pady=(6, 6))
+        tk.Checkbutton(parent, text="Сворачивать в трей при закрытии окна (по умолчанию выход)",
+                       variable=self.minimize_to_tray,
+                       command=lambda: self._save_preference("minimize_to_tray", self.minimize_to_tray),
+                       bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+                       activeforeground=TEXT, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 6))
+        tk.Checkbutton(parent, text="Запускать вместе со входом в Windows (без прав администратора)",
+                       variable=self.autostart_enabled, command=self._set_autostart,
+                       bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+                       activeforeground=TEXT, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 7))
+        self._label(parent, "Автозапуск запускает приложение свёрнутым только при доступном трее. "
+                    "После перезапуска SNMP-реквизиты вводятся заново.",
+                    9, color=MUTED).pack(anchor="w", pady=(0, 9))
         frame, self.events_table = self._tree(parent,
             ("Дата/время", "Уровень", "Событие", "Подробности"),
             (195, 125, 225, 630))
@@ -469,6 +500,7 @@ class NetApp(tk.Tk):
             self.messages.put(("scan_error", str(exc)))
 
     def toggle_monitor(self):
+        self._save_preference("monitor_enabled", self.monitor_enabled)
         if self.monitor_enabled.get():
             self._start_monitor()
         else:
@@ -481,27 +513,89 @@ class NetApp(tk.Tk):
             return
         self.monitor_stop = threading.Event()
         self.monitoring = True
-        threading.Thread(target=self._monitor_worker, args=(self.monitor_stop,), daemon=True).start()
+        self.monitor_thread = threading.Thread(target=self._monitor_worker, args=(self.monitor_stop,),
+                                               daemon=True, name="BloodskyMonitor")
+        self.monitor_thread.start()
         self._set_state("МОНИТОРИНГ", GREEN)
 
     def _monitor_worker(self, stop):
-        tick = 0
-        while not stop.is_set():
-            if not self.scanning:
-                with self.state_lock:
-                    ips = list(self.devices.keys())
-                    open_ports = {ip: list(d.ports) for ip, d in self.devices.items() if d.ports}
-                if self.gateway and self.gateway not in ips:
-                    ips.append(self.gateway)  # always measure gateway for latency graph
-                if ips:
-                    samples = net.poll_devices(ips, stop, open_ports)
-                    neighbors = net.arp_table()
-                    self.messages.put(("monitor", samples, neighbors))
-                if tick % 3 == 0:
-                    self._read_wifi_background()
-            tick += 1
-            stop.wait(max(3, self.monitor_interval))
-        self.messages.put(("monitor_stopped", stop))
+        try:
+            tick = 0
+            while not stop.is_set():
+                if not self.scanning:
+                    with self.state_lock:
+                        ips = list(self.devices.keys())
+                        open_ports = {ip: list(d.ports) for ip, d in self.devices.items() if d.ports}
+                    if self.gateway and self.gateway not in ips:
+                        ips.append(self.gateway)
+                    if ips:
+                        samples = net.poll_devices(ips, stop, open_ports)
+                        neighbors = net.arp_table()
+                        if not stop.is_set():
+                            self.messages.put(("monitor", samples, neighbors))
+                    if tick % 3 == 0:
+                        self._read_wifi_background()
+                tick += 1
+                self.monitor_failures = 0  # a complete iteration succeeded
+                stop.wait(max(3, self.monitor_interval))
+        except Exception:
+            if not stop.is_set():
+                # Do not serialize exception text: drivers and command arguments can leak data.
+                self.messages.put(("monitor_crashed", stop))
+        finally:
+            self.messages.put(("monitor_stopped", stop))
+
+    def _monitor_guard(self):
+        """Restart a crashed monitor with bounded backoff, never after user Stop."""
+        if self._closed:
+            return
+        if self.monitor_enabled.get() and not self.scanning:
+            thread = self.monitor_thread
+            if (thread is None or not thread.is_alive()) and time.monotonic() >= self.monitor_restart_at:
+                self.monitoring = False
+                if self.devices or self.gateway:
+                    self._start_monitor()
+        self.after(2500, self._monitor_guard)
+
+    def _save_preference(self, name, variable):
+        try:
+            self.store.set_preference(name, bool(variable.get()))
+        except Exception:
+            self._set_status("Не удалось сохранить настройки. Проверьте локальную базу данных.")
+
+    def _set_autostart(self):
+        desired = self.autostart_enabled.get()
+        try:
+            actual = windows_integration.set_autostart(desired)
+            self.autostart_enabled.set(actual)
+            if actual != desired:
+                raise OSError("Параметр автозапуска не применён")
+            self._set_status("Автозапуск Windows " + ("включён" if actual else "отключён"))
+        except OSError as exc:
+            self.autostart_enabled.set(windows_integration.is_autostart_enabled())
+            messagebox.showwarning("Автозапуск", str(exc), parent=self)
+
+    def _setup_tray(self):
+        if sys.platform != "win32":
+            return
+        tray = TrayController(lambda: self.messages.put(("tray_show",)),
+                              lambda: self.messages.put(("tray_exit",)))
+        if tray.start():
+            self.tray = tray
+        else:
+            # Without a working tray, never hide the only application window.
+            self.tray = None
+
+    def close_window(self):
+        if self.minimize_to_tray.get() and self.tray and self.tray.active:
+            self.withdraw()
+            return
+        self.shutdown()
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     def _read_wifi_background(self):
         if self._closed:
@@ -569,8 +663,22 @@ class NetApp(tk.Tk):
                 elif kind == "tool":
                     self._console_text(item[1])
                     self.tool_button.configure(state="normal")
+                elif kind == "monitor_crashed":
+                    if item[1] is self.monitor_stop and self.monitor_enabled.get():
+                        self.monitoring = False
+                        self.monitor_failures += 1
+                        delay = min(60, 3 * (2 ** min(self.monitor_failures - 1, 5)))
+                        self.monitor_restart_at = time.monotonic() + delay
+                        self._event("warning", "Мониторинг", f"Сбой опроса, повтор через {delay} сек")
+                        self._set_state("ВОССТАНОВЛЕНИЕ", YELLOW)
                 elif kind == "monitor_stopped":
-                    pass
+                    if item[1] is self.monitor_stop and not item[1].is_set() and self.monitor_enabled.get():
+                        self.monitoring = False
+                elif kind == "tray_show":
+                    self.show_window()
+                elif kind == "tray_exit":
+                    self.shutdown()
+                    return
         except queue.Empty:
             pass
         if self._dirty and time.monotonic() - self._last_paint > 0.45:
@@ -1266,6 +1374,9 @@ class NetApp(tk.Tk):
         self._closed = True
         self.scan_stop.set()
         self.monitor_stop.set()
+        if self.tray is not None:
+            self.tray.stop()
+            self.tray = None
         self.snmp_auto_enabled = False
         self.snmp_profiles.clear()
         self.snmp_due.clear()
