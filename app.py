@@ -21,6 +21,8 @@ def main():
         return 1
     from bloodsky_net.ui_easy import NetApp
     app = NetApp()
+    from bloodsky_net.app_branding import set_window_icon
+    set_window_icon(app)
     app.mainloop()
     return 0
 
