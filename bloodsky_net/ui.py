@@ -5,6 +5,7 @@ from collections import deque
 import json
 import sqlite3
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 import ipaddress
 import sys
 import math
@@ -22,6 +23,7 @@ from . import topology
 from . import map_view
 from . import time_machine
 from . import detective
+from . import detective_timeline
 from . import port_health
 from . import fdb
 from . import traffic
@@ -116,6 +118,7 @@ class NetApp(tk.Tk):
         self._timeline_last_capture = time.monotonic()
         self._gateway_failures = 0
         self._detective_findings = ()
+        self._detective_moments = ()
         self._timeline_index: dict[str, int] = {}
         self.timeline_before = tk.StringVar(value='')
         self.timeline_after = tk.StringVar(value='')
@@ -584,7 +587,7 @@ class NetApp(tk.Tk):
         parent = self._new_page('Детектив')
         note = self._panel(parent)
         note.pack(fill='x', pady=(0, 12))
-        self._label(note, 'ПОИСК ВЕРОЯТНЫХ ПРИЧИН · правила v2', 15, True, BLUE).pack(
+        self._label(note, 'ПОИСК ВЕРОЯТНЫХ ПРИЧИН · правила v2.1', 15, True, BLUE).pack(
             anchor='w', padx=15, pady=(12, 4))
         self._label(note, 'По кнопке анализирует только имеющиеся свежие ICMP/ARP/Wi-Fi/SNMP '
                     'наблюдения и последние изменения LLDP. Не отправляет данные в облако, '
@@ -606,6 +609,12 @@ class NetApp(tk.Tk):
         self.detective_table.tag_configure('warning', foreground=YELLOW)
         self.detective_table.tag_configure('notice', foreground=TEXT)
         self.detective_table.tag_configure('info', foreground=MUTED)
+        self._label(parent, 'ХРОНОЛОГИЯ ПОДТВЕРЖДЁННЫХ НАБЛЮДЕНИЙ (UTC)', 10, True, BLUE).pack(
+            anchor='w', pady=(12, 5))
+        tframe, self.detective_timeline_table = self._tree(parent,
+            ('UTC', 'Источник', 'Наблюдение'), (190, 100, 670))
+        tframe.pack(fill='x')
+        self.detective_timeline_table.configure(height=4)
         self._label(parent, 'ПОЧЕМУ ТАКОЙ ВЫВОД И ЧТО ПРОВЕРИТЬ', 10, True, BLUE).pack(
             anchor='w', pady=(12, 5))
         self.detective_detail = tk.Text(parent, height=9, wrap='word', bg=PANEL, fg=TEXT,
@@ -653,6 +662,14 @@ class NetApp(tk.Tk):
             latest = {ip: state for ip, state in self._timeline_status.items()
                       if now - self._timeline_seen_at.get(ip, float('-inf')) <= max(90, 2 * self.monitor_interval + 30)}
         wifi_status = self.wifi_report.status
+        fresh_topology = self._fresh_topology()
+        now_utc = datetime.now(timezone.utc)
+        observed_faults = tuple(
+            detective_timeline.TimedPortFault(
+                d, now_utc - timedelta(seconds=max(0.0, now - self.topology_received.get(ip, now))))
+            for ip in sorted(fresh_topology)
+            for d in self.port_error_deltas.get(ip, ())[:100])
+        events = detective.recent_device_events(self.store.events(250))
         obs = detective.Observation(
             gateway=self.gateway or '', availability=latest,
             wifi_connected=(bool(wifi_status.connected)
@@ -662,10 +679,19 @@ class NetApp(tk.Tk):
                                  if self.ip_alert_expiry.get(ip, 0) > now),
             snmp_errors=tuple(sorted(self.topology_failed)),
             lldp_changes=self._detective_lldp_changes(),
-            recent_events=detective.recent_device_events(self.store.events(250)),
-            port_error_deltas=tuple(d for ip in self._fresh_topology()
-                                    for d in self.port_error_deltas.get(ip, ())))
+            recent_events=events,
+            port_error_deltas=tuple(d for ip in fresh_topology
+                                    for d in self.port_error_deltas.get(ip, ())),
+            lldp_endpoints=detective_timeline.verified_lldp_endpoints(
+                fresh_topology, tuple(self.devices.values())),
+            timed_port_faults=observed_faults)
         self._detective_findings = detective.diagnose(obs)
+        self._detective_moments = detective_timeline.timeline(events, observed_faults)
+        self.detective_timeline_table.delete(*self.detective_timeline_table.get_children())
+        for moment in self._detective_moments:
+            self.detective_timeline_table.insert('', 'end', values=(
+                moment.observed_at.isoformat(timespec='seconds'),
+                moment.source, moment.description[:220]))
         self.detective_table.delete(*self.detective_table.get_children())
         for n, f in enumerate(self._detective_findings):
             self.detective_table.insert('', 'end', iid=str(n),
@@ -704,7 +730,7 @@ class NetApp(tk.Tk):
             return
         try:
             with open(filename, 'w', encoding='utf-8') as fp:
-                json.dump(detective.export_report(self._detective_findings), fp, ensure_ascii=False, indent=2)
+                json.dump(detective.export_report(self._detective_findings, self._detective_moments), fp, ensure_ascii=False, indent=2)
             self._set_status('DETECTIVE: отчёт записан локально')
         except OSError:
             messagebox.showerror('Детектив', 'Не удалось сохранить отчёт.', parent=self)
@@ -720,7 +746,7 @@ class NetApp(tk.Tk):
             return
         try:
             with open(filename, 'w', encoding='utf-8') as fp:
-                fp.write(detective.export_html_report(self._detective_findings))
+                fp.write(detective.export_html_report(self._detective_findings, self._detective_moments))
             self._set_status('DETECTIVE: HTML-отчёт записан локально')
         except OSError:
             messagebox.showerror('Детектив', 'Не удалось сохранить отчёт.', parent=self)

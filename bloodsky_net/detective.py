@@ -11,6 +11,8 @@ import re
 from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
+from . import detective_timeline
+
 
 @dataclass(frozen=True)
 class Evidence:
@@ -40,6 +42,8 @@ class Observation:
     lldp_changes: Sequence[object] = ()  # Historical LinkChange from successful snapshots
     recent_events: Sequence[object] = ()  # Timestamped, whitelisted monitor events
     port_error_deltas: Sequence[object] = ()  # Delta between fresh SNMP IF-MIB polls
+    lldp_endpoints: Sequence[detective_timeline.LldpEndpoint] = ()
+    timed_port_faults: Sequence[detective_timeline.TimedPortFault] = ()
 
 
 @dataclass(frozen=True)
@@ -238,6 +242,16 @@ def diagnose(o: Observation) -> tuple[Finding, ...]:
                  'Сравнить с исправным портом и журналом коммутатора.')))
         except (AttributeError, ValueError, TypeError):
             continue
+    for linked in detective_timeline.correlate(o.recent_events, o.lldp_endpoints, o.timed_port_faults):
+        findings.append(Finding(linked.code,
+            'warning' if linked.code == 'lldp_port_temporal_match' else 'notice',
+            'средняя' if linked.code == 'lldp_port_temporal_match' else 'низкая',
+            ('ICMP и ошибки порта LLDP-соседа' if linked.code == 'lldp_port_temporal_match'
+             else 'Одновременные сбои LLDP-соседей коммутатора'),
+            linked.description,
+            tuple(Evidence('Временная корреляция', x) for x in linked.evidence),
+            ('Сверить журналы коммутатора и текущие статусы интерфейсов.',
+             'Проверить связь другим протоколом или с другой точки; ICMP может фильтроваться.')))
     if not findings:
         findings.append(Finding('insufficient_evidence', 'info', 'нет оценки',
             'Нет достаточных данных для диагноза',
@@ -249,11 +263,13 @@ def diagnose(o: Observation) -> tuple[Finding, ...]:
     return tuple(findings[:30])
 
 
-def export_report(findings: Sequence[Finding]) -> dict:
+def export_report(findings: Sequence[Finding], timeline: Sequence[detective_timeline.IncidentMoment] = ()) -> dict:
     """Explicit, bounded whitelist. Contains network IDs; caller must obtain user action."""
     return {
         'product': 'BLOODSKY NET',
-        'engine': 'DETECTIVE rules v2',
+        'engine': 'DETECTIVE rules v2.1',
+        'timeline': [{'timestamp': m.observed_at.isoformat(timespec='seconds'),
+                      'source': m.source, 'observation': m.description} for m in list(timeline)[-60:]],
         'disclaimer': 'Предположения по измерениям; отсутствие ICMP/LLDP не доказывает поломку. Отчёт содержит сетевые идентификаторы.',
         'findings': [{
             'code': f.code, 'severity': f.severity, 'confidence': f.confidence,
@@ -264,9 +280,15 @@ def export_report(findings: Sequence[Finding]) -> dict:
     }
 
 
-def export_html_report(findings: Sequence[Finding]) -> str:
+def export_html_report(findings: Sequence[Finding], timeline: Sequence[detective_timeline.IncidentMoment] = ()) -> str:
     """Offline printable HTML report. No remote assets or script execution."""
     esc = lambda value: html.escape(str(value), quote=True)
+    incident_rows = ''.join(f'<tr><td>{esc(m.observed_at.isoformat(timespec="seconds"))}</td>'
+                            f'<td>{esc(m.source)}</td><td>{esc(m.description)}</td></tr>'
+                            for m in list(timeline)[-60:])
+    history_html = ('<h2>Временная шкала наблюдений</h2><table><thead><tr>'
+                    '<th>UTC</th><th>Источник</th><th>Наблюдение</th></tr></thead><tbody>'
+                    + incident_rows + '</tbody></table>') if incident_rows else ''
     sections = []
     for f in list(findings)[:30]:
         evidence = ''.join(f'<li><b>{esc(e.source)}:</b> {esc(e.observation)}</li>' for e in f.evidence[:10])
@@ -279,8 +301,8 @@ def export_html_report(findings: Sequence[Finding]) -> str:
             "<title>BLOODSKY NET — отчёт DETECTIVE</title>"
             "<style>body{font:15px Arial,sans-serif;max-width:900px;margin:36px auto;color:#203044;}"
             "section{border:1px solid #ced5de;border-radius:8px;padding:14px 18px;margin:18px 0}"
-            "h1,h2{color:#174a80}li{margin:6px 0}</style></head><body>"
-            "<h1>BLOODSKY NET · DETECTIVE v2</h1>"
+            "h1,h2{color:#174a80}li{margin:6px 0}th,td{padding:7px;text-align:left;border-bottom:1px solid #ccd;}</style></head><body>"
+            "<h1>BLOODSKY NET · DETECTIVE v2.1</h1>"
             "<p>Локальный отчёт. Выводы вероятностны; ICMP/LLDP и счётчики не доказывают физическую поломку. "
             "Содержит сетевые идентификаторы — передавайте только уполномоченным получателям.</p>"
-            + ''.join(sections) + '</body></html>')
+            + history_html + ''.join(sections) + '</body></html>')
