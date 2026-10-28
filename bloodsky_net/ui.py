@@ -24,6 +24,7 @@ from . import wifi_radar
 from . import distributed_probes as probes
 from . import probe_transport
 from . import probe_peers
+from . import probe_recovery
 from . import wifi_survey
 from . import wifi_survey_compare
 from . import wifi_survey_audit
@@ -92,6 +93,7 @@ class NetApp(tk.Tk):
         self.probe_receiver = None
         self.probe_send_busy = False
         self.probe_last_auto = time.monotonic()
+        self.probe_retry = probe_recovery.RetryState()
         self.tray: TrayController | None = None
         self.gateway, route_ip = net.default_gateway()
         self.local_route_ip = route_ip
@@ -1371,6 +1373,7 @@ class NetApp(tk.Tk):
         self._button(actions, 'Доверенные получатели', self._probes_trusted_dialog).pack(side='left')
         self._button(actions, 'Разрешённые отправители', self._probes_senders_dialog).pack(side='left', padx=8)
         self._button(actions, 'Журнал измерений', self._probes_activity_dialog).pack(side='left', padx=8)
+        self._button(actions, 'Статус отправителей', self._probes_sender_states).pack(side='left', padx=8)
         self.probes_activity_note = self._label(actions, 'Входящих измерений пока нет', 9, color=MUTED)
         self.probes_activity_note.pack(side='left', padx=7)
         self._label(secure, 'Сертификат подтверждает получателя; личный код — доступ отправителя, но не физический ПК. '
@@ -1509,9 +1512,64 @@ class NetApp(tk.Tk):
         self._button(toolbar,'Сохранить адрес и SHA-256',save).pack(side='left')
         self._button(toolbar,'Использовать выбранного',use).pack(side='left',padx=7)
         self._button(toolbar,'Удалить',remove).pack(side='left')
+        def rotate_pin():
+            current=selected()
+            if not current:
+                messagebox.showinfo('Смена сертификата','Выберите получателя.',parent=dialog)
+                return
+            from tkinter import simpledialog
+            new=simpledialog.askstring('Новый SHA-256',
+                'Введите полный отпечаток из независимого доверенного канала:',parent=dialog)
+            if not new:
+                return
+            try:
+                probe_transport.validate_fingerprint(new)
+                if probe_transport.validate_fingerprint(new) == current.fingerprint:
+                    raise ValueError('Новый отпечаток совпадает со старым')
+            except ValueError as exc:
+                messagebox.showerror('Смена сертификата',str(exc),parent=dialog)
+                return
+            if not messagebox.askyesno('Подтверждение нового сертификата',
+                f'Новый SHA-256 проверен по независимому каналу для {current.alias} ({current.host}:{current.port})?\n'
+                'Нельзя подтверждать отпечаток только по ошибке TLS или из непроверенного сообщения.',
+                parent=dialog):
+                return
+            try:
+                updated=probe_recovery.approved_pin_rotation(current,current.fingerprint,new,True)
+                self.store.upsert_trusted_destination(updated.alias,updated.host,
+                    updated.port,updated.fingerprint)
+                self.probe_peer_key.set('')
+                self.probe_auto.set(False)
+                self.probe_retry=probe_recovery.RetryState()
+                refresh()
+                messagebox.showinfo('Сертификат обновлён',
+                    'Отпечаток сохранён. Введите ключ отправителя заново и отправьте вручную.',parent=dialog)
+            except (ValueError,sqlite3.Error) as exc:
+                messagebox.showerror('Смена сертификата',str(exc),parent=dialog)
+        self._button(toolbar,'Сменить SHA-256 вручную',rotate_pin).pack(side='left',padx=7)
         self._label(panel,'Код доступа здесь не сохраняется. Подтвердите новый отпечаток '
                     'по доверенному каналу перед передачей измерений.',9,color=MUTED).pack(anchor='w')
         refresh()
+
+    def _probes_sender_states(self):
+        """Show per-key measurement arrivals, not actual machine connectivity."""
+        dialog = tk.Toplevel(self)
+        dialog.title('Данные доверенных отправителей · UTC')
+        dialog.configure(bg=BG)
+        dialog.geometry('900x430')
+        panel = self._panel(dialog)
+        panel.pack(fill='both', expand=True, padx=12, pady=12)
+        frame, table = self._tree(panel, ('ID ключа', 'Последнее получение UTC', 'Наблюдение'),
+                                  (190, 240, 430))
+        frame.pack(fill='both', expand=True)
+        current = probe_recovery.sender_states(
+            tuple(self.store.trusted_sender_hashes()), self.store.probe_activities(2048),
+            datetime.now(timezone.utc))
+        for x in current:
+            at = x.last_received.isoformat(timespec='seconds') if x.last_received else '—'
+            table.insert('', 'end', values=(x.peer_id, at, x.note))
+        self._label(panel, 'Отсутствие новых пакетов не подтверждает отключение компьютера.',
+                    9, color=MUTED).pack(anchor='w', pady=8)
 
     def _probes_activity_dialog(self):
         dialog=tk.Toplevel(self)
@@ -1570,7 +1628,9 @@ class NetApp(tk.Tk):
         self.probe_access.set('')
         self._set_status('Приём отключён. Личные ключи остаются разрешёнными до отзыва.')
 
-    def _probes_send(self):
+    def _probes_send(self, manual=True):
+        if manual:
+            self.probe_retry=probe_recovery.RetryState()
         if self.probe_send_busy:
             return
         try:
@@ -1593,8 +1653,10 @@ class NetApp(tk.Tk):
             try:
                 probe_transport.send_snapshot(host, port, cert, code, snapshot, peer_id=peer_id)
                 self.messages.put(('probe_send_result', True, 'TLS-пакет принят удалённой точкой.',peer_alias,len(snapshot.readings)))
-            except Exception:
-                self.messages.put(('probe_send_result', False, 'Обмен не удался: проверьте сеть, TLS и код получателя.'))
+            except Exception as exc:
+                kind=probe_recovery.failure_kind(exc)
+                self.messages.put(('probe_send_result', False,
+                    'Обмен не удался: проверьте сеть, TLS и разрешение получателя.',kind))
         threading.Thread(target=worker, daemon=True, name='BloodskyProbeSend').start()
 
     def _probes_network_tick(self):
@@ -1615,8 +1677,10 @@ class NetApp(tk.Tk):
             if imported:
                 self._probes_refresh()
                 self._set_status('TLS-пакет получен с личным ключом; имя — ID ключа, не подтверждение ПК.')
-        if self.probe_auto.get() and not self.probe_send_busy and time.monotonic()-self.probe_last_auto >= 60:
-            self._probes_send()
+        if (self.probe_auto.get() and not self.probe_send_busy
+                and time.monotonic()-self.probe_last_auto >= 60
+                and probe_recovery.ready(self.probe_retry,time.monotonic())):
+            self._probes_send(manual=False)
         note,_ = probe_peers.recent_receive_state(self.store.probe_activities(200),datetime.now(timezone.utc))
         self.probes_activity_note.configure(text=note)
         self.after(1000, self._probes_network_tick)
@@ -1994,7 +2058,14 @@ class NetApp(tk.Tk):
                     self.probe_send_busy = False
                     if item[1] and len(item) >= 5:
                         self.store.record_probe_activity('tls_sent',item[3],item[4])
-                    self._set_status(item[2])
+                    if item[1]:
+                        self.probe_retry=probe_recovery.RetryState()
+                    else:
+                        self.probe_retry=probe_recovery.failed(
+                            self.probe_retry,item[3],time.monotonic())
+                        if self.probe_retry.blocked:
+                            self.probe_auto.set(False)
+                    self._set_status(item[2] + (' ' + self.probe_retry.reason if not item[1] else ''))
                 elif kind == "tray_show":
                     self.show_window()
                 elif kind == "tray_exit":
