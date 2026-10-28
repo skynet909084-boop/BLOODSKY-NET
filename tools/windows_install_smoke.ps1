@@ -2,7 +2,10 @@
 # Validates actual silent installation, the packaged binary, and uninstallation.
 # Never launches a network scan or modifies the real per-user BLOODSKY database.
 $ErrorActionPreference = 'Stop'
-$setup = (Resolve-Path 'installer\output\BLOODSKY-NET-Setup-0.9.0-rc1.exe').Path
+# Locate the single installer produced by this build; never pin a previous version.
+$setups = @(Get-ChildItem -Path 'installer\output' -Filter 'BLOODSKY-NET-Setup-*.exe' -File)
+if ($setups.Count -ne 1) { throw "Expected exactly one setup artifact, got $($setups.Count)" }
+$setup = $setups[0].FullName
 $dir = Join-Path $env:TEMP 'BLOODSKY-NET-Install-Smoke'
 $exe = Join-Path $dir 'BLOODSKY-NET.exe'
 $uninstaller = Join-Path $dir 'unins000.exe'
