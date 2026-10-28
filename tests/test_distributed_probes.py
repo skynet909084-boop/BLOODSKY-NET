@@ -42,6 +42,14 @@ class ProbeFileTests(unittest.TestCase):
         raw = json.loads(p.encode(snapshot())); raw['readings'][0]['state']='offline'
         with self.assertRaises(ValueError): p.decode(json.dumps(raw).encode())
 
+    def test_numeric_or_bool_ip_rejected_from_file(self):
+        for item in (42, True, False, None, {}, []):
+            with self.subTest(item=item):
+                raw = json.loads(p.encode(snapshot()))
+                raw['readings'][0]['ip'] = item
+                with self.assertRaises(ValueError):
+                    p.decode(json.dumps(raw).encode())
+
     def test_duplicate_ip_rejected(self):
         raw = json.loads(p.encode(snapshot())); raw['readings'].append(raw['readings'][0])
         with self.assertRaises(ValueError): p.decode(json.dumps(raw).encode())
