@@ -288,6 +288,10 @@ class Device:
     user_label: str = ''
     hostname_source: str = ''
     vendor_source: str = ''
+    model: str = ''  # Device-advertised UPnP model
+    friendly_name: str = ''  # Device-advertised UPnP name
+    claimed_manufacturer: str = ''  # Not necessarily OUI holder
+    identity_source: str = ''  # Untrusted UPnP description
 
     def to_dict(self) -> dict:
         return asdict(self)
