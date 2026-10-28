@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 import ctypes
+from functools import lru_cache
 import ipaddress
 import os
 import platform
@@ -212,6 +213,46 @@ def friendly_hostname(ip: str) -> str:
         return ""
 
 
+
+def parse_netbios_hostname(text: str) -> str:
+    """Parse the Windows NetBIOS workstation <00> UNIQUE line, not workgroups."""
+    for line in text.splitlines():
+        match = re.match(r'^\s*([^<>\r\n]{1,40}?)\s+<00>\s+UNIQUE\b', line, re.I)
+        if match:
+            value = match.group(1).strip()
+            if re.fullmatch(r'[\w][\w.-]{0,62}', value, re.U):
+                return value[:63]
+    return ''
+
+
+def netbios_hostname(ip: str) -> str:
+    """Windows-only optional local name source, no browser or Internet lookup."""
+    if os.name != 'nt':
+        return ''
+    try:
+        ipaddress.IPv4Address(ip)
+    except ValueError:
+        return ''
+    code, output = command(['nbtstat', '-A', ip], timeout=2.5)
+    return parse_netbios_hostname(output) if code == 0 else ''
+
+
+def is_private_mac(mac: str) -> bool:
+    mac = normalize_mac(mac)
+    return bool(mac) and bool(int(mac[:2], 16) & 0x03)
+
+
+@lru_cache(maxsize=4096)
+def _oui_lookup(mac: str) -> str:
+    """Local OUI database lookup. Never transmit MAC values outside the PC."""
+    try:
+        from pymanuf import lookup
+        value = lookup(mac)
+        return value.strip()[:120] if isinstance(value,str) and value.strip() else ''
+    except (ImportError, ValueError, KeyError, TypeError, OSError):
+        return ''
+
+
 def classify_device(gateway: str, ip: str, hostname: str, ports: list[int]) -> str:
     h = hostname.lower()
     if ip == gateway:
@@ -244,6 +285,9 @@ class Device:
     seen: str = ""
     failures: int = 0
     is_gateway: bool = False
+    user_label: str = ''
+    hostname_source: str = ''
+    vendor_source: str = ''
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -254,7 +298,12 @@ class Device:
 
 
 def mac_vendor(mac: str) -> str:
-    return VENDORS.get(normalize_mac(mac)[:8], "Не определён") if mac else "Не определён"
+    normalized = normalize_mac(mac)
+    if not normalized:
+        return 'Не определён'
+    if is_private_mac(normalized):
+        return 'Не определён (локальный/случайный MAC)'
+    return _oui_lookup(normalized) or VENDORS.get(normalized[:8], 'Не определён')
 
 
 def scan_network(cidr: str, gateway: str, stop: threading.Event,
@@ -276,7 +325,11 @@ def scan_network(cidr: str, gateway: str, stop: threading.Event,
             return None
         ports = sorted(set(minimal_ports + probe_ports(ip, PORTS, 0.14)))
         hostname = friendly_hostname(ip)
-        device = Device(ip=ip, hostname=hostname, ports=ports,
+        name_source = 'DNS PTR' if hostname else ''
+        if not hostname:
+            hostname = netbios_hostname(ip)
+            name_source = 'Windows NetBIOS' if hostname else ''
+        device = Device(ip=ip, hostname=hostname, hostname_source=name_source, ports=ports,
                         online=(ping.alive or bool(ports)), latency_ms=ping.rtt_ms,
                         kind=classify_device(gateway, ip, hostname, ports),
                         seen=now_iso(), is_gateway=ip == gateway)
@@ -302,12 +355,14 @@ def scan_network(cidr: str, gateway: str, stop: threading.Event,
     for ip, mac in neighbors.items():
         if ip not in found and ipaddress.ip_address(ip) in ipaddress.ip_network(cidr):
             found[ip] = Device(ip=ip, mac=mac, vendor=mac_vendor(mac),
+                               vendor_source='OUI (владелец MAC-блока)' if not is_private_mac(mac) else '',
                                online=False, seen=now_iso(), is_gateway=ip == gateway)
             if on_found:
                 on_found(found[ip])
         elif ip in found:
             found[ip].mac = mac
             found[ip].vendor = mac_vendor(mac)
+            found[ip].vendor_source = 'OUI (владелец MAC-блока)' if not is_private_mac(mac) else ''
     return list(found.values()), neighbors, count
 
 
