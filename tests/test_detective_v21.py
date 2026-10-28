@@ -103,7 +103,7 @@ class DetectiveV21Tests(unittest.TestCase):
         self.assertIn('не подтверждённая',item.interpretation)
         moments=timeline(obs.recent_events,obs.timed_port_faults)
         j=export_report(findings,moments)
-        self.assertEqual(j['engine'],'DETECTIVE rules v2.2')
+        self.assertEqual(j['engine'],'DETECTIVE rules v2.3')
         self.assertEqual(len(j['timeline']),2)
         self.assertIn('2026',json.dumps(j))
         html=export_html_report(findings,moments)
