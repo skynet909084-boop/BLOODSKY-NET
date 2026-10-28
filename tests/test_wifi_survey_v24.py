@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from bloodsky_net.wifi_survey import validate_point, survey_report, survey_html_report
-from bloodsky_net.wifi_survey_compare import compare_visits, comparison_html
+from bloodsky_net.wifi_survey_compare import compare_visits, comparison_html, compose_visit_html
 from bloodsky_net.storage import Storage
 from bloodsky_net.wifi_floorplan import sanitize_floorplan
 
@@ -109,6 +109,18 @@ class SurveyVisitTests(unittest.TestCase):
         self.assertNotIn('https://',html)
         invalid=SimpleNamespace(jpeg=b'javascript:alert(1)',width=80,height=50)
         self.assertNotIn('data:image/jpeg;base64,',comparison_html(data,[],[],invalid))
+
+    def test_printable_html_csp_allows_only_embedded_plan_image(self):
+        report=survey_report(points(),'Этаж 1','25 октября')
+        base=survey_html_report(report)
+        comp=compare_visits(points(),'Этаж 1','1 сентября','25 октября')
+        html=compose_visit_html(base,comp,points()[:3],points()[3:])
+        self.assertIn('img-src data:',html)
+        self.assertIn('default-src &apos;none&apos;',html)
+        self.assertNotIn('script-src',html)
+        self.assertNotIn('https://',html)
+        with self.assertRaises(ValueError):
+            compose_visit_html('<body></body>',comp,[],[])
 
     def test_corrupt_timestamp_does_not_create_false_date(self):
         rows=points(); altered=[*rows[:3],point('25 октября',10,40)]
