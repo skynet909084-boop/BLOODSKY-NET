@@ -2533,6 +2533,87 @@ class NetApp(tk.Tk):
     def _draw_charts(self):
         self._draw_curve(self.latency_canvas, list(self.latency_history), GREEN)
         self._draw_curve(self.signal_canvas, list(self.signal_history), BLUE, 100)
+        self._draw_consumption()
+
+    def _draw_consumption(self):
+        """Only measured SNMP/FDB port shares, never claim full LAN visibility."""
+        if not hasattr(self, 'usage_canvas'):
+            return
+        canvas = self.usage_canvas
+        canvas.delete('all')
+        width = max(230, canvas.winfo_width())
+        height = max(140, canvas.winfo_height())
+        palette = ('#4ABEF1', '#4CD4A5', '#FFBD60', '#FF6D7D', '#9D8DFF', '#55C0BD')
+        with self.state_lock:
+            devices = tuple(self.devices.values())
+        fresh = self._fresh_topology()
+        usage = device_traffic.measured_usage(devices, fresh, self.port_rates)
+        total = sum(u.mbps for u in usage)
+        cx, cy, radius = 77, max(68, min(height // 2, height - 40)), 43
+        canvas.create_oval(cx-radius, cy-radius, cx+radius, cy+radius,
+                           outline=PANEL_ALT, width=20)
+        if total > 0:
+            angle = 90.0
+            for i, item in enumerate(usage):
+                if item.mbps <= 0:
+                    continue
+                length = 360.0 * item.mbps / total
+                if length >= 359.95:
+                    canvas.create_oval(cx-radius, cy-radius, cx+radius, cy+radius,
+                                       outline=palette[i % len(palette)], width=20)
+                else:
+                    canvas.create_arc(cx-radius, cy-radius, cx+radius, cy+radius,
+                                      start=angle-length, extent=length,
+                                      style='arc', outline=palette[i % len(palette)], width=20)
+                angle -= length
+        canvas.create_text(cx, cy-7, text=f'{total:.2f}', fill=TEXT,
+                           font=('Segoe UI Semibold', 13))
+        canvas.create_text(cx, cy+12, text='Мбит/с*', fill=MUTED,
+                           font=('Segoe UI', 9))
+        if usage:
+            for n, item in enumerate(usage[:8]):
+                x = 160 + (n // 4) * max(230, (width-175)//2)
+                y = 22 + (n % 4)*33
+                canvas.create_oval(x, y+4, x+9, y+13, fill=palette[n % len(palette)], outline='')
+                name = item.label if len(item.label) <= 19 else item.label[:18] + '…'
+                canvas.create_text(x+15, y, text=name, anchor='nw', fill=TEXT,
+                                   font=('Segoe UI', 9))
+                canvas.create_text(x+15, y+15,
+                    text=(f'↓{item.download_mbps:.1f} ↑{item.upload_mbps:.1f} Мбит/с · {100*item.mbps/total:.0f}%'
+                          if total else '0 Мбит/с'), anchor='nw', fill=MUTED, font=('Segoe UI', 8))
+            self.usage_note.configure(text=(
+                f'* {len(usage)} однозначных портов (показано {min(8,len(usage))}), текущий SNMP. '
+                '↓/↑ и детали — режим «Специалист» → «Порты». Не весь трафик LAN.'))
+        else:
+            canvas.create_text(width-8, cy, anchor='e', text='Нет данных по устройствам',
+                               fill=MUTED, font=('Segoe UI', 9))
+            self.usage_note.configure(text='Включите SNMP-автоопрос коммутатора; нужны два замера и FDB. '
+                                      'Без доступа к портам трафик соседей не измерить.')
+
+    def _discover_models(self):
+        """User-initiated SSDP, off the Tk thread, no auto-network discovery."""
+        if self.identity_busy or self.scanning:
+            return
+        with self.state_lock:
+            count = len(self.devices)
+        if not count:
+            messagebox.showinfo('Распознавание устройств', 'Сначала просканируйте сеть.', parent=self)
+            return
+        if not messagebox.askyesno('Уточнить модели устройств',
+            'Отправить один локальный UPnP/SSDP запрос в выбранную подсеть? '
+            'Устройства могут сообщить модель и производителя, но эти сведения не проверены.',
+            parent=self):
+            return
+        self.identity_busy = True
+        subnet = self.network_value.get().strip()
+        def worker():
+            try:
+                result = device_identity.discover(subnet)
+                self.messages.put(('identity_results', result))
+            except (OSError, ValueError):
+                self.messages.put(('identity_error',))
+        threading.Thread(target=worker, daemon=True, name='BloodskyUPnP').start()
+        self._set_status('UPnP: запрашиваем имена и модели в локальной сети…')
 
 
     def _open_fullscreen_map(self):
