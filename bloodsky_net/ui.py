@@ -21,6 +21,7 @@ from . import wifi
 from . import topology
 from . import map_view
 from . import time_machine
+from . import detective
 from . import fdb
 from . import traffic
 from . import notifications
@@ -87,6 +88,7 @@ class NetApp(tk.Tk):
         self.wifi_report = wifi.WifiReport(wifi.WifiStatus(), [], [])
         self.wifi_warning_previous = ""
         self.wifi_previously_observed = False
+        self._wifi_observed_at = float('-inf')
         self.traffic_last_rate = (0.0, 0.0)
         self.mac_history = net.MacHistory()
         self.ip_alerts: dict[str, net.MacChange] = {}
@@ -110,6 +112,8 @@ class NetApp(tk.Tk):
         self._timeline_status: dict[str, str] = {}  # current-session measurements only
         self._timeline_seen_at: dict[str, float] = {}
         self._timeline_last_capture = time.monotonic()
+        self._gateway_failures = 0
+        self._detective_findings = ()
         self._timeline_index: dict[str, int] = {}
         self.timeline_before = tk.StringVar(value='')
         self.timeline_after = tk.StringVar(value='')
@@ -194,7 +198,7 @@ class NetApp(tk.Tk):
         self._label(brand, "N E T W O R K  M O N I T O R", 8, color=MUTED).pack(anchor="w", pady=(2, 0))
         self._label(sidebar, "РАЗДЕЛЫ", 9, True, MUTED).pack(anchor="w", padx=22, pady=(35, 12))
         navigation = [("◫", "Обзор"), ("▤", "Устройства"), ("◇", "Карта сети"),
-                      ("◉", "Wi-Fi"), ("⇅", "Порты"), ("◷", "Машина времени"), ("⌁", "Диагностика"), ("▣", "События")]
+                      ("◉", "Wi-Fi"), ("⇅", "Порты"), ("◷", "Машина времени"), ("⌕", "Детектив"), ("⌁", "Диагностика"), ("▣", "События")]
         for glyph, name in navigation:
             btn = tk.Button(sidebar, text=f"  {glyph}   {name}", relief="flat", borderwidth=0,
                             anchor="w", padx=19, pady=13, font=("Segoe UI", 11),
@@ -249,6 +253,7 @@ class NetApp(tk.Tk):
         self._page_wifi()
         self._page_ports()
         self._page_time_machine()
+        self._page_detective()
         self._page_tools()
         self._page_events()
         self.alert_banner = self._label(right, "", 10, True, YELLOW)
@@ -270,7 +275,7 @@ class NetApp(tk.Tk):
         self.title_label.configure(text={"Обзор": "Обзор сети", "Устройства": "Обнаруженные устройства",
                                          "Карта сети": "Карта локальной сети", "Wi-Fi": "Мониторинг Wi-Fi",
                                          "Порты": "Трафик портов коммутаторов",
-                                         "Машина времени": "NETWORK TIME MACHINE",
+                                         "Машина времени": "NETWORK TIME MACHINE", "Детектив": "BLOODSKY DETECTIVE",
                                          "Диагностика": "Инструменты диагностики", "События": "Журнал событий"}[page])
         for name, btn in self.nav_buttons.items():
             btn.configure(bg=PANEL_ALT if name == page else SIDEBAR,
@@ -572,6 +577,131 @@ class NetApp(tk.Tk):
             self._set_status('Экспорт сравнения сохранён локально.')
         except OSError as exc:
             messagebox.showerror('Машина времени', str(exc), parent=self)
+
+    def _page_detective(self):
+        parent = self._new_page('Детектив')
+        note = self._panel(parent)
+        note.pack(fill='x', pady=(0, 12))
+        self._label(note, 'ПОИСК ВЕРОЯТНЫХ ПРИЧИН · правила v1', 15, True, BLUE).pack(
+            anchor='w', padx=15, pady=(12, 4))
+        self._label(note, 'По кнопке анализирует только имеющиеся свежие ICMP/ARP/Wi-Fi/SNMP '
+                    'наблюдения и последние изменения LLDP. Не отправляет данные в облако, '
+                    'не выполняет скрытых сканирований и не изменяет настройки сети.',
+                    9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', padx=15, pady=(0, 12))
+        bar = tk.Frame(parent, bg=BG)
+        bar.pack(fill='x', pady=(0, 10))
+        self._button(bar, 'Найти вероятную причину', self._detective_analyze, primary=True).pack(side='left')
+        self._button(bar, 'Экспорт отчёта JSON', self._detective_export).pack(side='right')
+        self.detective_note = self._label(parent, 'Нажмите кнопку. Для лучших результатов включите мониторинг и SNMP-опрос.',
+                                           10, color=MUTED)
+        self.detective_note.pack(anchor='w', pady=(0, 10))
+        frame, self.detective_table = self._tree(parent,
+            ('Важность', 'Уверенность', 'Наблюдение'), (125, 130, 680))
+        frame.pack(fill='both', expand=True)
+        self.detective_table.configure(height=6)
+        self.detective_table.bind('<<TreeviewSelect>>', self._detective_select)
+        self.detective_table.tag_configure('warning', foreground=YELLOW)
+        self.detective_table.tag_configure('notice', foreground=TEXT)
+        self.detective_table.tag_configure('info', foreground=MUTED)
+        self._label(parent, 'ПОЧЕМУ ТАКОЙ ВЫВОД И ЧТО ПРОВЕРИТЬ', 10, True, BLUE).pack(
+            anchor='w', pady=(12, 5))
+        self.detective_detail = tk.Text(parent, height=9, wrap='word', bg=PANEL, fg=TEXT,
+            insertbackground=TEXT, relief='flat', font=('Segoe UI', 10), padx=12, pady=10)
+        self.detective_detail.pack(fill='x')
+        self.detective_detail.configure(state='disabled')
+        self._label(parent, 'Выводы основаны на наблюдениях, не являются доказательством причины. '
+                    'Экспорт содержит IP, имена устройств и другие сетевые идентификаторы.',
+                    9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', pady=(9, 0))
+
+    def _detective_lldp_changes(self):
+        """At most one freshest pair per switch; both captures must be recent.
+
+        A historical change is deliberately NOT promoted to a live outage.
+        """
+        from datetime import datetime, timezone
+        try:
+            captures = self.store.lldp_captures(100)
+        except sqlite3.Error:
+            return ()
+        grouped = {}
+        now = datetime.now(timezone.utc)
+        for ident, stamp, ip, _name, _count in captures:
+            try:
+                age = (now - datetime.fromisoformat(stamp).astimezone(timezone.utc)).total_seconds()
+            except (ValueError, TypeError):
+                continue
+            if age < 0 or age > 1800:
+                continue
+            if len(grouped.setdefault(ip, [])) < 2:
+                grouped[ip].append(ident)
+        changes = []
+        for ip, ids in list(sorted(grouped.items()))[:10]:
+            if len(ids) == 2:
+                try:
+                    changes.extend(self.store.compare_lldp_captures(ids[1], ids[0])[:5])
+                except (ValueError, sqlite3.Error):
+                    continue
+        return tuple(changes[:20])
+
+    def _detective_analyze(self):
+        now = time.monotonic()
+        # Only recent measurements are used; restored inventory is not an observation.
+        with self.state_lock:
+            latest = {ip: state for ip, state in self._timeline_status.items()
+                      if now - self._timeline_seen_at.get(ip, float('-inf')) <= max(90, 2 * self.monitor_interval + 30)}
+        wifi_status = self.wifi_report.status
+        obs = detective.Observation(
+            gateway=self.gateway or '', availability=latest,
+            wifi_connected=(bool(wifi_status.connected)
+                            if self.wifi_previously_observed and wifi_status.adapter
+                            and now - self._wifi_observed_at <= 180 else None),
+            arp_suspicions=tuple(ip for ip in self.ip_alerts
+                                 if self.ip_alert_expiry.get(ip, 0) > now),
+            snmp_errors=tuple(sorted(self.topology_failed)),
+            lldp_changes=self._detective_lldp_changes())
+        self._detective_findings = detective.diagnose(obs)
+        self.detective_table.delete(*self.detective_table.get_children())
+        for n, f in enumerate(self._detective_findings):
+            self.detective_table.insert('', 'end', iid=str(n),
+                values=({'warning':'Предупреждение','notice':'Внимание','info':'Информация'}[f.severity],
+                        f.confidence, f.title), tags=(f.severity,))
+        self.detective_note.configure(text=f'Результатов: {len(self._detective_findings)} · '
+            f'свежих ICMP: {len(latest)} · ошибок SNMP: {len(self.topology_failed)} · '
+            'выводы проверяемы, не являются доказательствами поломки')
+        self.detective_table.selection_set('0')
+        self._detective_select()
+
+    def _detective_select(self, _event=None):
+        selection = self.detective_table.selection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if index >= len(self._detective_findings):
+            return
+        f = self._detective_findings[index]
+        detail = f'{f.title} · уверенность: {f.confidence}\n\n{f.interpretation}\n\nДОКАЗАТЕЛЬСТВА/НАБЛЮДЕНИЯ:\n'
+        detail += ''.join(f'• {e.source}: {e.observation}\n' for e in f.evidence)
+        detail += '\nЧТО ПРОВЕРИТЬ:\n' + ''.join(f'{n}. {a}\n' for n, a in enumerate(f.checks, 1))
+        self.detective_detail.configure(state='normal')
+        self.detective_detail.delete('1.0', 'end')
+        self.detective_detail.insert('1.0', detail)
+        self.detective_detail.configure(state='disabled')
+
+    def _detective_export(self):
+        if not self._detective_findings:
+            messagebox.showinfo('Детектив', 'Сначала выполните анализ.', parent=self)
+            return
+        filename = filedialog.asksaveasfilename(
+            title='Отчёт DETECTIVE (содержит IP и имена оборудования)',
+            defaultextension='.json', filetypes=[('JSON', '*.json')], parent=self)
+        if not filename:
+            return
+        try:
+            with open(filename, 'w', encoding='utf-8') as fp:
+                json.dump(detective.export_report(self._detective_findings), fp, ensure_ascii=False, indent=2)
+            self._set_status('DETECTIVE: отчёт записан локально')
+        except OSError:
+            messagebox.showerror('Детектив', 'Не удалось сохранить отчёт.', parent=self)
 
     def _page_ports(self):
         parent = self._new_page("Порты")
@@ -1038,6 +1168,12 @@ class NetApp(tk.Tk):
         self._observe_neighbors(neighbors)
         now = time.monotonic()
         with self.state_lock:
+            if self.gateway and self.gateway in samples:
+                gw_result = samples[self.gateway]
+                self._gateway_failures = 0 if gw_result.alive else self._gateway_failures + 1
+                self._timeline_status[self.gateway] = ('up' if gw_result.alive else
+                    ('down' if self._gateway_failures >= 2 else 'unknown'))
+                self._timeline_seen_at[self.gateway] = now
             for ip, ping in samples.items():
                 dev = self.devices.get(ip)
                 if dev is not None:
@@ -1062,6 +1198,7 @@ class NetApp(tk.Tk):
             elif state.connected and previous.connected and state.bssid and previous.bssid and state.bssid != previous.bssid:
                 self._event("info", "Wi-Fi переключился на другую точку", f"{state.ssid}: {previous.bssid} → {state.bssid}")
         self.wifi_previously_observed = True
+        self._wifi_observed_at = time.monotonic()
         self.wifi_report = report
         self.signal_history.append(float(state.signal) if state.connected else None)
         now = time.monotonic()
