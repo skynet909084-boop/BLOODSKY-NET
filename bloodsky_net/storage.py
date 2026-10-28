@@ -153,6 +153,18 @@ class Storage:
             self.db.execute("DELETE FROM wifi_samples WHERE id NOT IN (SELECT id FROM wifi_samples ORDER BY id DESC LIMIT 20160)")
         self.db.commit()
 
+    def wifi_radar_rows(self, limit: int = 20160) -> list[tuple]:
+        """Historical Windows WLAN measurements. No scan, no credentials.
+
+        Samples carry local time offsets; date comparisons are done in the
+        pure radar engine, not with SQLite's text comparison.
+        """
+        n = max(1, min(20160, int(limit)))
+        rows = self.db.execute(
+            "SELECT ts, connected, ssid, bssid, signal, channel "
+            "FROM wifi_samples ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+        return list(reversed(rows))
+
     def wifi_signal_history(self, limit: int = 100) -> list[float | None]:
         count = max(1, min(int(limit), 1000))
         rows = self.db.execute("SELECT connected, signal FROM wifi_samples ORDER BY id DESC LIMIT ?", (count,)).fetchall()
