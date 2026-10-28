@@ -22,6 +22,7 @@ from . import wifi
 from . import wifi_radar
 from . import wifi_survey
 from . import wifi_survey_compare
+from . import wifi_survey_audit
 from . import wifi_floorplan
 from . import topology
 from . import map_view
@@ -935,6 +936,14 @@ class NetApp(tk.Tk):
         self._button(bar, 'Экспорт CSV', self._wifi_survey_export).pack(side='right')
         self._button(bar, 'Отчёт HTML', self._wifi_survey_export_html).pack(side='right', padx=6)
         self._button(bar, 'Отчёт JSON', self._wifi_survey_export_json).pack(side='right')
+        audit_bar = tk.Frame(parent, bg=BG)
+        audit_bar.pack(fill='x', pady=(0, 7))
+        self._button(audit_bar, 'Проверить повторяемость', self._wifi_survey_audit_refresh).pack(side='left')
+        self._button(audit_bar, 'Сводка этажей JSON', self._wifi_survey_audit_json).pack(side='left', padx=8)
+        self._button(audit_bar, 'Сводка этажей HTML', self._wifi_survey_audit_html).pack(side='left')
+        self.survey_audit_note = self._label(audit_bar, 'Проверка полноты измерений выбранной серии по всем этажам.',
+            9, color=MUTED, wraplength=430, justify='left')
+        self.survey_audit_note.pack(side='left', padx=10)
         self.survey_note = self._label(parent, 'Для измерения подключитесь к Wi-Fi и обновите эфир на вкладке Wi-Fi.',
                                        9, color=MUTED, wraplength=950, justify='left')
         self.survey_note.pack(anchor='w', pady=(0, 7))
@@ -1072,6 +1081,7 @@ class NetApp(tk.Tk):
             f'всего: {len(points)}. Для нового обследования задайте другую серию и нажмите «Показать этаж».')
         self._wifi_survey_load_current_plan()
         self._wifi_survey_draw()
+        self._wifi_survey_audit_refresh()
 
     def _wifi_survey_load_current_plan(self):
         zone = self.survey_zone.get().strip()
@@ -1211,6 +1221,53 @@ class NetApp(tk.Tk):
                 self._set_status('Wi-Fi RADAR: отчёт JSON сохранён локально')
             except OSError:
                 messagebox.showerror('Wi-Fi RADAR', 'Не удалось записать JSON.', parent=self)
+
+    def _wifi_survey_audit_data(self):
+        try:
+            return wifi_survey_audit.audit_floors(
+                self.store.wifi_survey_points(), self.survey_series.get())
+        except (sqlite3.Error, ValueError) as exc:
+            messagebox.showerror('Wi-Fi RADAR', f'Ошибка проверки замеров: {str(exc)[:160]}', parent=self)
+            return None
+
+    def _wifi_survey_audit_refresh(self):
+        report = self._wifi_survey_audit_data()
+        if report is None:
+            return
+        problematic = sum(f['sampling_review_groups'] for f in report['floors'])
+        self.survey_audit_note.configure(text=(
+            f'Этажей с измерениями: {len(report["floors"])} · точек: {report["sample_count"]} · '
+            f'комнат/SSID/этапов для проверки: {problematic}. Данные не равны покрытию этажа.'))
+
+    def _wifi_survey_audit_json(self):
+        report = self._wifi_survey_audit_data()
+        if report is None:
+            return
+        filename = filedialog.asksaveasfilename(
+            title='Wi-Fi RADAR — проверка обследования этажей (SSID, комнаты)',
+            defaultextension='.json', filetypes=[('JSON', '*.json')], parent=self)
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as fp:
+                    json.dump(report, fp, ensure_ascii=False, indent=2)
+                self._set_status('Wi-Fi RADAR: сводка этажей JSON сохранена.')
+            except OSError:
+                messagebox.showerror('Wi-Fi RADAR', 'Не удалось сохранить сводку JSON.', parent=self)
+
+    def _wifi_survey_audit_html(self):
+        report = self._wifi_survey_audit_data()
+        if report is None:
+            return
+        filename = filedialog.asksaveasfilename(
+            title='Wi-Fi RADAR — отчёт о полноте обследования этажей',
+            defaultextension='.html', filetypes=[('HTML', '*.html')], parent=self)
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as fp:
+                    fp.write(wifi_survey_audit.audit_html_report(report))
+                self._set_status('Wi-Fi RADAR: сводка этажей HTML сохранена.')
+            except OSError:
+                messagebox.showerror('Wi-Fi RADAR', 'Не удалось сохранить сводку HTML.', parent=self)
 
     def _wifi_survey_export_html(self):
         report = self._wifi_survey_report_data()
