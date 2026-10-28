@@ -62,6 +62,7 @@ class NetApp(tk.Tk):
         self.messages: queue.Queue = queue.Queue()
         self.scan_stop = threading.Event()
         self.monitor_stop = threading.Event()
+        self._wifi_busy = threading.Event()
         self.scanning = False
         self.monitoring = False
         self.monitor_thread: threading.Thread | None = None
@@ -598,9 +599,24 @@ class NetApp(tk.Tk):
         self.focus_force()
 
     def _read_wifi_background(self):
-        if self._closed:
+        """Allow at most one slow WLAN query at a time (no thread buildup)."""
+        if self._closed or self._wifi_busy.is_set():
             return
-        threading.Thread(target=lambda: self.messages.put(("wifi", wifi.read_wifi())), daemon=True).start()
+        self._wifi_busy.set()
+        def worker():
+            try:
+                report = wifi.read_wifi()
+                if not self._closed:
+                    self.messages.put(("wifi", report))
+            except Exception:
+                # Background Windows WLAN failures may be transient; never log driver output.
+                pass
+            finally:
+                self._wifi_busy.clear()
+        try:
+            threading.Thread(target=worker, daemon=True, name="BloodskyWiFi").start()
+        except RuntimeError:
+            self._wifi_busy.clear()
 
     def _drain(self):
         if self._closed:
