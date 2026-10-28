@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  release:
+    types: [published]
 
 jobs:
   exe:
@@ -19,6 +21,8 @@ jobs:
         run: python -m pip install -r requirements.txt "pyinstaller>=6,<7"
       - name: Validate SNMP imports
         run: python -c "from pysnmp.hlapi.v3arch.asyncio import SnmpEngine, walk_cmd, USM_AUTH_HMAC192_SHA256, USM_PRIV_CFB128_AES"
+      - name: Generate BLOODSKY Windows icons
+        run: python tools/build_branding.py
       - name: Compile and test
         run: |
           python -m compileall -q app.py bloodsky_net
@@ -27,7 +31,23 @@ jobs:
           python tools/probe_stability_soak.py
           python tools/probe_security_soak.py
       - name: Build portable EXE
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all pysnmp --collect-all Cryptodome --collect-all pystray --collect-all PIL --collect-all cryptography --name BLOODSKY-NET app.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all pysnmp --collect-all Cryptodome --collect-all pystray --collect-all PIL --collect-all cryptography --icon assets/BLOODSKY-NET.ico --name BLOODSKY-NET app.py
+      - name: Verify embedded BLOODSKY EXE icon
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          from PIL import Image
+          import pefile
+          exe = Path("dist/BLOODSKY-NET.exe")
+          assert exe.is_file() and exe.stat().st_size > 1024 * 1024
+          with Image.open("assets/BLOODSKY-NET.ico") as icon:
+              assert icon.size == (256, 256)
+          pe = pefile.PE(str(exe), fast_load=False)
+          resources = [e.id for e in pe.DIRECTORY_ENTRY_RESOURCE.entries]
+          assert 14 in resources and 3 in resources, "Windows icon missing from EXE"
+          print("BLOODSKY icon present in EXE resource table")
+          '@ | python -
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --yes --no-progress
@@ -65,3 +85,22 @@ jobs:
           name: BLOODSKY-NET-Windows
           path: dist/BLOODSKY-NET.exe
           if-no-files-found: error
+
+  publish_release:
+    if: github.event_name == 'release'
+    needs: exe
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: BLOODSKY-NET-*
+          path: release-files
+          merge-multiple: true
+      - name: Attach verified Windows artifacts to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -lh release-files
+          gh release upload "${{ github.event.release.tag_name }}" release-files/BLOODSKY-NET.exe release-files/BLOODSKY-NET-Setup-*.exe release-files/checksums-sha256.txt --clobber --repo "${{ github.repository }}"
