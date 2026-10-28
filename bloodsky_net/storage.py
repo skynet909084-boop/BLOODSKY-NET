@@ -98,6 +98,9 @@ class Storage:
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
             event TEXT NOT NULL, label TEXT NOT NULL, reading_count INTEGER NOT NULL)""")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_probe_activity_ts ON probe_activity(ts)")
+        # Persistent allowlist contains only hashes of 256-bit random codes.
+        self.db.execute("""CREATE TABLE IF NOT EXISTS probe_trusted_senders (
+            peer_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL)""")
         self.db.commit()
         self._wifi_writes = 0
         self._port_writes = 0
@@ -505,6 +508,41 @@ class Storage:
         alias = safe_label(alias)
         with self.db:
             self.db.execute('DELETE FROM probe_trusted_destinations WHERE alias=?',(alias,))
+
+    def create_trusted_sender(self, peer_id: str):
+        """Issue a fresh key; return plaintext only once, store only its verifier."""
+        import secrets
+        from .probe_transport import validate_peer_id, fingerprint_token, MAX_TRUSTED_SENDERS
+        peer_id = validate_peer_id(peer_id)
+        token = secrets.token_hex(32)
+        digest = fingerprint_token(token)
+        with self.db:
+            exists = self.db.execute('SELECT 1 FROM probe_trusted_senders WHERE peer_id=?',
+                                     (peer_id,)).fetchone()
+            count = self.db.execute('SELECT count(*) FROM probe_trusted_senders').fetchone()[0]
+            if not exists and count >= MAX_TRUSTED_SENDERS:
+                raise ValueError('Не более 32 доверенных отправителей')
+            self.db.execute('INSERT INTO probe_trusted_senders(peer_id,token_hash) VALUES(?,?) '
+                            'ON CONFLICT(peer_id) DO UPDATE SET token_hash=excluded.token_hash',
+                            (peer_id, digest))
+        return token
+
+    def trusted_sender_hashes(self) -> dict[str, str]:
+        from .probe_transport import validate_peer_id, validate_token_hash
+        result = {}
+        for peer_id,digest in self.db.execute(
+                'SELECT peer_id,token_hash FROM probe_trusted_senders ORDER BY peer_id LIMIT 32'):
+            try:
+                result[validate_peer_id(peer_id)] = validate_token_hash(digest)
+            except ValueError:
+                continue
+        return result
+
+    def revoke_trusted_sender(self, peer_id: str):
+        from .probe_transport import validate_peer_id
+        peer_id = validate_peer_id(peer_id)
+        with self.db:
+            self.db.execute('DELETE FROM probe_trusted_senders WHERE peer_id=?',(peer_id,))
 
     def record_probe_activity(self, event: str, label: str, count: int,
                               at=None):
