@@ -23,8 +23,26 @@ jobs:
         run: |
           python -m compileall -q app.py bloodsky_net
           python -m unittest discover -s tests -v
+          python tools/soak_test.py
       - name: Build portable EXE
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all pysnmp --collect-all Cryptodome --collect-all pystray --collect-all PIL --name BLOODSKY-NET app.py
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+      - name: Build per-user Windows installer
+        shell: pwsh
+        run: |
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $compiler)) { $compiler = Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe' }
+          if (-not (Test-Path $compiler)) { throw 'Inno Setup compiler not installed' }
+          & $compiler 'installer\BLOODSKY-NET.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: BLOODSKY-NET-Installer
+          path: installer/output/BLOODSKY-NET-Setup-*.exe
+          if-no-files-found: error
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
