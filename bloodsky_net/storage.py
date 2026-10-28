@@ -92,6 +92,12 @@ class Storage:
             id TEXT PRIMARY KEY, created_at TEXT NOT NULL, label TEXT NOT NULL,
             json TEXT NOT NULL)""")
         self.db.execute('CREATE INDEX IF NOT EXISTS idx_probe_packages_created ON probe_packages(created_at)')
+        self.db.execute("""CREATE TABLE IF NOT EXISTS probe_trusted_destinations (
+            alias TEXT PRIMARY KEY, host TEXT NOT NULL, port INTEGER NOT NULL, fingerprint TEXT NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS probe_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+            event TEXT NOT NULL, label TEXT NOT NULL, reading_count INTEGER NOT NULL)""")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_probe_activity_ts ON probe_activity(ts)")
         self.db.commit()
         self._wifi_writes = 0
         self._port_writes = 0
@@ -464,6 +470,74 @@ class Storage:
             try:
                 result.append(probes.decode(payload.encode('utf-8')))
             except (ValueError, AttributeError):
+                continue
+        return tuple(result)
+
+    def upsert_trusted_destination(self, alias: str, host: str, port: int, fingerprint: str):
+        """Only a pinned receiver address; NEVER persist TLS bearer codes or private keys."""
+        from .probe_peers import validate_destination, MAX_PROFILES
+        p = validate_destination(alias, host, port, fingerprint)
+        with self.db:
+            exists = self.db.execute('SELECT 1 FROM probe_trusted_destinations WHERE alias=?',
+                                     (p.alias,)).fetchone()
+            count = self.db.execute('SELECT count(*) FROM probe_trusted_destinations').fetchone()[0]
+            if not exists and count >= MAX_PROFILES:
+                raise ValueError('Не более 32 доверенных получателей')
+            self.db.execute('INSERT INTO probe_trusted_destinations(alias,host,port,fingerprint) '
+                            'VALUES(?,?,?,?) ON CONFLICT(alias) DO UPDATE SET '
+                            'host=excluded.host,port=excluded.port,fingerprint=excluded.fingerprint',
+                            (p.alias,p.host,p.port,p.fingerprint))
+        return p
+
+    def trusted_destinations(self):
+        from .probe_peers import validate_destination
+        entries = []
+        for alias,host,port,fp in self.db.execute(
+                'SELECT alias,host,port,fingerprint FROM probe_trusted_destinations ORDER BY alias LIMIT 32'):
+            try:
+                entries.append(validate_destination(alias,host,port,fp))
+            except ValueError:
+                continue
+        return tuple(entries)
+
+    def delete_trusted_destination(self, alias: str):
+        from .probe_peers import safe_label
+        alias = safe_label(alias)
+        with self.db:
+            self.db.execute('DELETE FROM probe_trusted_destinations WHERE alias=?',(alias,))
+
+    def record_probe_activity(self, event: str, label: str, count: int,
+                              at=None):
+        from datetime import datetime, timezone
+        from .probe_peers import ALLOWED_EVENTS, safe_label, MAX_ACTIVITY_ROWS
+        if event not in ALLOWED_EVENTS or type(count) is not int or not 0 <= count <= 256:
+            raise ValueError('Недопустимое событие обмена')
+        label = safe_label(label)
+        stamp = at or datetime.now(timezone.utc)
+        if not isinstance(stamp, datetime) or stamp.tzinfo is None:
+            raise ValueError('Недопустимая дата события')
+        iso = stamp.astimezone(timezone.utc).isoformat()
+        with self.db:
+            self.db.execute('INSERT INTO probe_activity(ts,event,label,reading_count) VALUES(?,?,?,?)',
+                            (iso,event,label,count))
+            self.db.execute("DELETE FROM probe_activity WHERE datetime(ts) < datetime('now','-14 days')")
+            self.db.execute('DELETE FROM probe_activity WHERE id NOT IN '
+                            '(SELECT id FROM probe_activity ORDER BY id DESC LIMIT ?)',
+                            (MAX_ACTIVITY_ROWS,))
+
+    def probe_activities(self, limit: int = 200):
+        from datetime import datetime
+        from .probe_peers import ProbeActivity, ALLOWED_EVENTS
+        rows = self.db.execute('SELECT ts,event,label,reading_count FROM probe_activity '
+                               'ORDER BY id DESC LIMIT ?', (max(1,min(2048,int(limit))),)).fetchall()
+        result = []
+        for ts,event,label,count in rows:
+            try:
+                at = datetime.fromisoformat(ts)
+                if at.tzinfo is None or event not in ALLOWED_EVENTS:
+                    continue
+                result.append(ProbeActivity(at,event,label,int(count)))
+            except (TypeError,ValueError):
                 continue
         return tuple(result)
 
