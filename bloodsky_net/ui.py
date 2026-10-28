@@ -17,6 +17,7 @@ from . import __version__
 from . import network as net
 from . import wifi
 from . import topology
+from . import map_view
 from . import fdb
 from . import traffic
 from . import notifications
@@ -98,6 +99,9 @@ class NetApp(tk.Tk):
         self.signal_history: deque[float | None] = deque(self.store.wifi_signal_history(100), maxlen=100)
         self.traffic_samples: deque[tuple[float, dict]] = deque(maxlen=2)
         self.selected_ip = ""
+        self.map_query = tk.StringVar(value="")
+        self.map_status = tk.StringVar(value="Все")
+        self.map_zoom = tk.StringVar(value="100%")
         self._dirty = False
         self._last_paint = 0.0
         self._closed = False
@@ -316,8 +320,19 @@ class NetApp(tk.Tk):
         parent = self._new_page("Карта сети")
         top = tk.Frame(parent, bg=BG)
         top.pack(fill="x", pady=(0, 10))
-        self._label(top, "Зелёный — доступен     Красный — недоступен     Жёлтый — конфликт под вопросом", 10,
-                    color=MUTED).pack(side="left")
+        self._label(top, "Поиск", 10, color=MUTED).pack(side="left")
+        search = tk.Entry(top, textvariable=self.map_query, bg=PANEL_ALT, fg=TEXT,
+                          insertbackground=TEXT, relief="flat", width=21, font=("Segoe UI", 10))
+        search.pack(side="left", padx=(8, 12), ipady=8)
+        search.bind("<KeyRelease>", lambda _event: self._draw_map())
+        status = ttk.Combobox(top, state="readonly", values=map_view.STATUS_OPTIONS,
+                              textvariable=self.map_status, width=14, style="Night.TCombobox")
+        status.pack(side="left", padx=(0, 10))
+        status.bind("<<ComboboxSelected>>", lambda _event: self._draw_map())
+        zoom = ttk.Combobox(top, state="readonly", values=("75%", "100%", "125%", "150%"),
+                            textvariable=self.map_zoom, width=5, style="Night.TCombobox")
+        zoom.pack(side="left")
+        zoom.bind("<<ComboboxSelected>>", lambda _event: self._draw_map())
         self._button(top, "Сохранить карту SVG", self.export_map).pack(side="right", padx=(8, 0))
         self._button(top, "Опрос SNMP/LLDP", self._snmp_dialog, primary=True).pack(side="right")
         self._button(top, "Стоп автоопрос", self._stop_snmp_auto).pack(side="right", padx=(0, 8))
@@ -332,6 +347,11 @@ class NetApp(tk.Tk):
         self.map_canvas.pack(side="left", fill="both", expand=True)
         self.map_canvas.bind("<Configure>", lambda e: self._draw_map())
         self.map_canvas.bind("<MouseWheel>", lambda e: self.map_canvas.yview_scroll(-int(e.delta / 120), "units"))
+        self.map_legend = self._label(parent,
+            "● Зелёный — доступен   ● Красный — не отвечает   ● Жёлтый — IP-подозрение   "
+            "──── Синий — LLDP-наблюдение   - - - Пунктир — схема, не кабель",
+            9, color=MUTED)
+        self.map_legend.pack(anchor="w", pady=(5, 0))
         self.topology_note = self._label(parent, "LLDP: ещё не опрашивались управляемые устройства. Сплошная линия — подтверждённый LLDP-сосед.",
                                          9, color=MUTED)
         self.topology_note.pack(anchor="w", pady=(8, 5))
@@ -960,73 +980,72 @@ class NetApp(tk.Tk):
         self._draw_curve(self.latency_canvas, list(self.latency_history), GREEN)
         self._draw_curve(self.signal_canvas, list(self.signal_history), BLUE, 100)
 
+    def _map_selection(self, devices=None):
+        if devices is None:
+            with self.state_lock:
+                devices = list(self.devices.values())
+        return map_view.select_devices(devices, self.map_query.get(),
+                                       self.map_status.get(), self.ip_alerts)
+
     def _draw_map(self, devices=None):
         if not hasattr(self, "map_canvas"):
             return
-        with self.state_lock:
-            devices = list(self.devices.values()) if devices is None else devices
+        view = self._map_selection(devices)
+        zoom = int(self.map_zoom.get().rstrip("%")) / 100.0
         canvas = self.map_canvas
         canvas.delete("all")
-        width = max(canvas.winfo_width(), 880)
-        height = max(canvas.winfo_height(), 590)
+        width, height = max(canvas.winfo_width(), 880), max(canvas.winfo_height(), 590)
         center_x, center_y = width // 2, max(280, height // 2)
-        canvas.create_text(24, 22, text=f"КАРТА · {len(devices)} устройств · LLDP подтверждённые связи: {len(topology.physical_links(self._fresh_topology(), devices))}", fill=MUTED,
-                           anchor="w", font=("Segoe UI Semibold", 10))
-        canvas.create_oval(center_x - 68, center_y - 46, center_x + 68, center_y + 46,
+        observed = map_view.lldp_edges(self._fresh_topology(), view.devices)
+        canvas.create_text(24, 22,
+                           text=f"LIVE MAP · показано {len(view.devices)} из {view.total_matched} "
+                                f"(всего {view.total_inventory}) · LLDP-соседств: {len(observed)}",
+                           fill=MUTED, anchor="w", font=("Segoe UI Semibold", 10))
+        canvas.create_oval(center_x-68, center_y-46, center_x+68, center_y+46,
                            fill="#1B4566", outline=BLUE, width=2)
-        canvas.create_text(center_x, center_y - 10, text="ЛОКАЛЬНАЯ", fill=TEXT, font=("Segoe UI Semibold", 10))
-        canvas.create_text(center_x, center_y + 9, text="СЕТЬ", fill=TEXT, font=("Segoe UI Semibold", 10))
-        canvas.create_text(center_x, center_y + 57, text=f"Шлюз: {self.gateway or '—'}", fill=BLUE,
-                           font=("Segoe UI", 10))
-        positions = []
-        ordered = sorted(devices, key=lambda d: ipaddress.ip_address(d.ip))[:120]
-        remaining = len(devices) - len(ordered)
-        cursor = 0
-        ring = 0
-        while cursor < len(ordered):
-            capacity = 18 + ring * 12
-            this_ring = ordered[cursor:cursor + capacity]
-            radius = 185 + ring * 145
-            for idx, dev in enumerate(this_ring):
-                angle = (2 * math.pi * idx / max(1, len(this_ring))) - math.pi / 2
-                x = center_x + radius * math.cos(angle)
-                y = center_y + radius * math.sin(angle)
-                positions.append((dev, x, y))
-            cursor += len(this_ring)
-            ring += 1
-        max_r = 185 + max(0, ring - 1) * 145
-        max_x = max(width, center_x + max_r + 150)
-        max_y = max(height, center_y + max_r + 100)
-        canvas.configure(scrollregion=(min(0, center_x - max_r - 150), min(0, center_y - max_r - 100),
-                                       max_x, max_y))
-        for dev, x, y in positions:
+        canvas.create_text(center_x, center_y-10, text="ЛОКАЛЬНАЯ", fill=TEXT,
+                           font=("Segoe UI Semibold", 10))
+        canvas.create_text(center_x, center_y+9, text="СЕТЬ", fill=TEXT,
+                           font=("Segoe UI Semibold", 10))
+        canvas.create_text(center_x, center_y+57, text=f"Шлюз: {self.gateway or '—'}",
+                           fill=BLUE, font=("Segoe UI", 10))
+        positions = map_view.ring_positions(view.devices, zoom)
+        reach = max((abs(x) for _, x, _ in positions), default=185 * zoom)
+        reach_y = max((abs(y) for _, _, y in positions), default=185 * zoom)
+        canvas.configure(scrollregion=(min(0, center_x-reach-155), min(0, center_y-reach_y-115),
+                                       max(width, center_x+reach+155),
+                                       max(height, center_y+reach_y+105)))
+        for dev, dx, dy in positions:
+            x, y = center_x+dx, center_y+dy
             canvas.create_line(center_x, center_y, x, y, fill="#2D4761", width=1, dash=(4, 4))
-        physical = topology.physical_links(self._fresh_topology(), devices)
-        point_by_ip = {dev.ip: (x, y) for dev, x, y in positions}
-        for source, target, neighbor in physical:
+        point_by_ip = {dev.ip: (center_x+dx, center_y+dy) for dev, dx, dy in positions}
+        for source, target, neighbor in observed:
             if source not in point_by_ip or target not in point_by_ip:
                 continue
             x1, y1 = point_by_ip[source]
             x2, y2 = point_by_ip[target]
             canvas.create_line(x1, y1, x2, y2, fill=BLUE, width=3)
-            canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2 - 9,
+            canvas.create_text((x1+x2)/2, (y1+y2)/2-9,
                                text=f"{neighbor.local_port} ↔ {neighbor.remote_port}"[:34],
                                fill=BLUE, font=("Segoe UI", 9))
-        for dev, x, y in positions:
+        for dev, dx, dy in positions:
+            x, y = center_x+dx, center_y+dy
             key = f"host:{dev.ip}"
             color = YELLOW if dev.ip in self.ip_alerts else (GREEN if dev.online else RED)
-            canvas.create_oval(x - 12, y - 12, x + 12, y + 12,
+            canvas.create_oval(x-12, y-12, x+12, y+12,
                                fill=color, outline=BG, width=2, tags=(key, "node"))
-            canvas.create_text(x, y + 23, text=dev.ip, fill=TEXT,
+            canvas.create_text(x, y+23, text=dev.ip, fill=TEXT,
                                font=("Consolas", 10), tags=(key, "node"))
-            canvas.create_text(x, y + 38, text=(dev.hostname or dev.kind)[:24], fill=MUTED,
+            canvas.create_text(x, y+38, text=(dev.hostname or dev.kind)[:24], fill=MUTED,
                                font=("Segoe UI", 9), tags=(key, "node"))
             canvas.tag_bind(key, "<Button-1>", lambda e, ip=dev.ip: self._map_pick(ip))
-        if remaining > 0:
-            canvas.create_text(24, 46, text=f"Для читаемости показаны первые 120 узлов; ещё {remaining} — во вкладке «Устройства»",
+        if view.omitted:
+            canvas.create_text(24, 46, text=f"Ещё {view.omitted} узлов не помещаются на карту: уточните фильтр",
                                fill=YELLOW, anchor="w", font=("Segoe UI", 9))
-        if not devices:
-            canvas.create_text(center_x, center_y + 85, text="Начните сканирование подсети для построения карты",
+        if not view.devices:
+            msg = ("Нет устройств под текущим фильтром" if view.total_inventory else
+                   "Начните сканирование подсети для построения карты")
+            canvas.create_text(center_x, center_y+85, text=msg,
                                fill=MUTED, font=("Segoe UI", 12))
 
     def _paint_neighbors(self, devices):
@@ -1334,45 +1353,37 @@ class NetApp(tk.Tk):
             self._set_status(f"Сохранён отчёт: {filename}")
 
     def export_map(self):
-        # Vector SVG requires no additional packages and captures the entire map.
+        """Export the exact filtered view, with observed LLDP lines distinguished from layout."""
         from html import escape
         filename = filedialog.asksaveasfilename(defaultextension=".svg", filetypes=[("Векторная карта SVG", "*.svg")],
                                                 initialfile="bloodsky_network_map.svg", parent=self)
         if not filename:
             return
-        devices = sorted(self.devices.values(), key=lambda d: ipaddress.ip_address(d.ip))
-        positions = []
-        offset = 0
-        ring = 0
-        while offset < len(devices):
-            group = devices[offset: offset + 18 + ring * 12]
-            radius = 185 + ring * 145
-            for i, d in enumerate(group):
-                angle = 2 * math.pi * i / len(group) - math.pi / 2
-                positions.append((d, radius * math.cos(angle), radius * math.sin(angle)))
-            offset += len(group)
-            ring += 1
-        reach = max(350, 185 + max(0, ring - 1) * 145 + 150)
-        width = height = int(2 * reach + 40)
-        center = width / 2
+        view = self._map_selection()
+        zoom = int(self.map_zoom.get().rstrip("%")) / 100.0
+        positions = map_view.ring_positions(view.devices, zoom)
+        reach = max(350, max((max(abs(x), abs(y)) for _, x, y in positions), default=185*zoom)+150)
+        width = height = int(2*reach+40)
+        center = width/2
         parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
                  f'<rect width="100%" height="100%" fill="{PANEL}"/>',
-                 f'<text x="28" y="34" font-family="Segoe UI,sans-serif" font-size="20" fill="{TEXT}">BLOODSKY NET — карта сети (LLDP — сплошные линии)</text>']
+                 f'<text x="28" y="34" font-family="Segoe UI,sans-serif" font-size="20" fill="{TEXT}">BLOODSKY NET — LIVE MAP (LLDP-наблюдение ≠ проверка кабеля)</text>']
         for d, dx, dy in positions:
-            x, y = center + dx, center + dy
+            x, y = center+dx, center+dy
             parts.append(f'<line x1="{center}" y1="{center}" x2="{x:.1f}" y2="{y:.1f}" stroke="{BORDER}" stroke-dasharray="5 6"/>')
         parts += [f'<circle cx="{center}" cy="{center}" r="59" fill="#1B4566" stroke="{BLUE}" stroke-width="2"/>',
-                  f'<text x="{center}" y="{center + 5}" text-anchor="middle" fill="{TEXT}" font-size="17" font-family="Segoe UI,sans-serif">LAN</text>']
-        by_ip = {d.ip: (center + dx, center + dy) for d, dx, dy in positions}
-        for source, target, neighbor in topology.physical_links(self._fresh_topology(), devices):
-            if source in by_ip and target in by_ip:
-                x1, y1 = by_ip[source]
-                x2, y2 = by_ip[target]
-                parts.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="{BLUE}" stroke-width="3"/>')
-                port_label = escape((neighbor.local_port + ' ↔ ' + neighbor.remote_port)[:34])
-                parts.append(f'<text x="{(x1+x2)/2:.1f}" y="{(y1+y2)/2-9:.1f}" text-anchor="middle" fill="{BLUE}" font-size="11">{port_label}</text>')
+                  f'<text x="{center}" y="{center+5}" text-anchor="middle" fill="{TEXT}" font-size="17" font-family="Segoe UI,sans-serif">LAN</text>']
+        by_ip = {d.ip: (center+dx, center+dy) for d, dx, dy in positions}
+        for source, target, neighbor in map_view.lldp_edges(self._fresh_topology(), view.devices):
+            if source not in by_ip or target not in by_ip:
+                continue
+            x1, y1 = by_ip[source]
+            x2, y2 = by_ip[target]
+            parts.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="{BLUE}" stroke-width="3"/>')
+            port_label = escape((neighbor.local_port+' ↔ '+neighbor.remote_port)[:34])
+            parts.append(f'<text x="{(x1+x2)/2:.1f}" y="{(y1+y2)/2-9:.1f}" text-anchor="middle" fill="{BLUE}" font-size="11">{port_label}</text>')
         for d, dx, dy in positions:
-            x, y = center + dx, center + dy
+            x, y = center+dx, center+dy
             color = YELLOW if d.ip in self.ip_alerts else (GREEN if d.online else RED)
             label = escape((d.hostname or d.kind)[:28])
             parts.extend([f'<circle cx="{x:.1f}" cy="{y:.1f}" r="12" fill="{color}"/>',
@@ -1380,8 +1391,8 @@ class NetApp(tk.Tk):
                           f'<text x="{x:.1f}" y="{y+47:.1f}" text-anchor="middle" fill="{MUTED}" font-family="Segoe UI,sans-serif" font-size="11">{label}</text>'])
         parts.append('</svg>')
         try:
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write("\n".join(parts))
+            with open(filename, "w", encoding="utf-8") as fd:
+                fd.write("\n".join(parts))
             self._set_status(f"Карта SVG сохранена: {filename}")
         except OSError as exc:
             messagebox.showerror("Экспорт карты", str(exc), parent=self)
