@@ -26,6 +26,7 @@ class SurveyPoint:
     bssid: str
     signal: int  # percentage provided by Windows WLAN; not dBm
     channel: int
+    room: str = 'Без комнаты'
 
 
 @dataclass(frozen=True)
@@ -39,9 +40,12 @@ class ZoneQuality:
 
 
 def validate_point(zone: str, x: float, y: float, ssid: str,
-                   bssid: str, signal: int, channel: int, observed_at: str) -> SurveyPoint:
+                   bssid: str, signal: int, channel: int, observed_at: str,
+                   room: str = 'Без комнаты') -> SurveyPoint:
     if not isinstance(zone, str) or not zone.strip() or len(zone.strip()) > 60 or any(ord(c) < 32 for c in zone):
         raise ValueError('Название зоны: от 1 до 60 символов без управляющих знаков')
+    if not isinstance(room, str) or not room.strip() or len(room.strip()) > 60 or any(ord(c) < 32 for c in room):
+        raise ValueError('Название комнаты: от 1 до 60 символов без управляющих знаков')
     if type(x) not in (int, float) or type(y) not in (int, float) or not 0 <= x <= 100 or not 0 <= y <= 100:
         raise ValueError('Координаты должны быть в пределах 0–100')
     if not isinstance(ssid, str) or not ssid or len(ssid) > 128 or not BSSID.fullmatch(str(bssid)):
@@ -57,7 +61,7 @@ def validate_point(zone: str, x: float, y: float, ssid: str,
     if ts.tzinfo is None:
         raise ValueError('Отметка времени без часового пояса')
     return SurveyPoint(ts.astimezone(timezone.utc).isoformat(), zone.strip(),
-                       round(float(x), 3), round(float(y), 3), ssid, bssid.upper(), signal, channel)
+                       round(float(x), 3), round(float(y), 3), ssid, bssid.upper(), signal, channel, room.strip())
 
 
 def zone_quality(points: Sequence[SurveyPoint]) -> tuple[ZoneQuality, ...]:
@@ -84,3 +88,18 @@ def spreadsheet_safe(value: str) -> str:
     """Prevent CSV formula execution from user zone labels and nearby SSIDs."""
     text = str(value)
     return "'" + text if text.lstrip().startswith(('=', '+', '-', '@')) else text
+
+
+def room_quality(points: Sequence[SurveyPoint], zone: str) -> tuple[ZoneQuality, ...]:
+    """Observed coverage per *user-labelled* room, never inferred from pixel colors."""
+    groups: dict[str, list[SurveyPoint]] = defaultdict(list)
+    for p in points[:MAX_POINTS]:
+        if isinstance(p, SurveyPoint) and p.zone == zone and p.room:
+            groups[p.room].append(p)
+    result = []
+    for room in sorted(groups)[:MAX_ZONES]:
+        values = groups[room]
+        signals = [p.signal for p in values]
+        result.append(ZoneQuality(room, len(values), round(sum(signals)/len(signals), 1),
+                                  min(signals), max(signals), len({p.bssid for p in values})))
+    return tuple(result)

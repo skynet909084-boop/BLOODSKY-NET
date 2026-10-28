@@ -42,6 +42,10 @@ class Storage:
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, zone TEXT NOT NULL,
             x REAL NOT NULL, y REAL NOT NULL, ssid TEXT NOT NULL, bssid TEXT NOT NULL,
             signal INTEGER NOT NULL, channel INTEGER NOT NULL)""")
+        if 'room' not in {r[1] for r in self.db.execute('PRAGMA table_info(wifi_survey)')}:
+            self.db.execute("ALTER TABLE wifi_survey ADD COLUMN room TEXT NOT NULL DEFAULT 'Без комнаты'")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS wifi_floorplans (
+            zone TEXT PRIMARY KEY, image BLOB NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL)""")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_wifi_survey_ts ON wifi_survey(ts)")
         self.db.execute("CREATE TABLE IF NOT EXISTS wifi_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, connected INTEGER NOT NULL, ssid TEXT NOT NULL, bssid TEXT NOT NULL, signal INTEGER NOT NULL, channel INTEGER NOT NULL)")
         self.db.execute("""CREATE TABLE IF NOT EXISTS port_traffic (
@@ -160,15 +164,15 @@ class Storage:
 
     def save_wifi_survey_point(self, zone: str, x: float, y: float, ssid: str,
                                bssid: str, signal: int, channel: int,
-                               ts: str | None = None):
+                               ts: str | None = None, room: str = 'Без комнаты'):
         """Save an explicit manual survey; never read or persist WLAN credentials."""
         from .wifi_survey import validate_point, MAX_POINTS
-        point = validate_point(zone, x, y, ssid, bssid, signal, channel, ts or now_iso())
+        point = validate_point(zone, x, y, ssid, bssid, signal, channel, ts or now_iso(), room=room)
         with self.db:
             self.db.execute("""INSERT INTO wifi_survey
-                (ts, zone, x, y, ssid, bssid, signal, channel) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ts, zone, x, y, ssid, bssid, signal, channel, room) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (point.observed_at, point.zone, point.x, point.y, point.ssid,
-                 point.bssid, point.signal, point.channel))
+                 point.bssid, point.signal, point.channel, point.room))
             self.db.execute("DELETE FROM wifi_survey WHERE datetime(ts) < datetime('now', '-30 days')")
             self.db.execute("DELETE FROM wifi_survey WHERE id NOT IN (SELECT id FROM wifi_survey ORDER BY id DESC LIMIT ?)",
                             (MAX_POINTS,))
@@ -178,13 +182,44 @@ class Storage:
         """Bounded, chronological survey records; only manually captured points."""
         from .wifi_survey import SurveyPoint, MAX_POINTS
         if zone is None:
-            rows = self.db.execute("""SELECT ts, zone, x, y, ssid, bssid, signal, channel
+            rows = self.db.execute("""SELECT ts, zone, x, y, ssid, bssid, signal, channel, room
                                     FROM wifi_survey ORDER BY id DESC LIMIT ?""", (MAX_POINTS,)).fetchall()
         else:
-            rows = self.db.execute("""SELECT ts, zone, x, y, ssid, bssid, signal, channel
+            rows = self.db.execute("""SELECT ts, zone, x, y, ssid, bssid, signal, channel, room
                                     FROM wifi_survey WHERE zone=? ORDER BY id DESC LIMIT ?""",
                                    (zone, MAX_POINTS)).fetchall()
         return tuple(SurveyPoint(*r) for r in reversed(rows))
+
+    def save_wifi_floorplan(self, zone: str, source: bytes):
+        """Explicit local image import; bounded and sanitized before SQLite commit."""
+        from .wifi_survey import MAX_ZONES
+        from .wifi_floorplan import sanitize_floorplan
+        if not isinstance(zone, str) or not zone.strip() or len(zone.strip()) > 60 or any(ord(c) < 32 for c in zone):
+            raise ValueError('Недопустимое название этажа/зоны')
+        plan = sanitize_floorplan(source)
+        with self.db:
+            count = self.db.execute('SELECT COUNT(*) FROM wifi_floorplans').fetchone()[0]
+            exists = self.db.execute('SELECT 1 FROM wifi_floorplans WHERE zone=?', (zone.strip(),)).fetchone()
+            if not exists and count >= min(MAX_ZONES, 12):
+                raise ValueError('Достигнут лимит: 12 планов помещений')
+            self.db.execute('INSERT OR REPLACE INTO wifi_floorplans(zone,image,width,height) VALUES (?,?,?,?)',
+                            (zone.strip(), plan.jpeg, plan.width, plan.height))
+        return plan
+
+    def wifi_floorplan(self, zone: str):
+        from .wifi_floorplan import Floorplan, MAX_STORED_BYTES
+        row = self.db.execute('SELECT image,width,height FROM wifi_floorplans WHERE zone=?',
+                              (zone.strip(),)).fetchone()
+        if not row:
+            return None
+        blob, width, height = row
+        if not blob or len(blob) > MAX_STORED_BYTES or width <= 0 or height <= 0:
+            return None
+        return Floorplan(bytes(blob), int(width), int(height))
+
+    def delete_wifi_floorplan(self, zone: str):
+        with self.db:
+            self.db.execute('DELETE FROM wifi_floorplans WHERE zone=?', (zone.strip(),))
 
     def wifi_radar_rows(self, limit: int = 20160) -> list[tuple]:
         """Historical Windows WLAN measurements. No scan, no credentials.
