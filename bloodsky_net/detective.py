@@ -13,6 +13,7 @@ from typing import Mapping, Sequence
 
 from . import detective_timeline
 from . import topology_incidents
+from . import incident_patterns
 
 
 @dataclass(frozen=True)
@@ -298,11 +299,36 @@ def triage_steps(findings: Sequence[Finding], limit: int = 8) -> tuple[str, ...]
     return tuple(result[:limit])
 
 
-def export_report(findings: Sequence[Finding], timeline: Sequence[detective_timeline.IncidentMoment] = ()) -> dict:
+def recurrence_findings(rows: Sequence[tuple], now: datetime | None = None) -> tuple[Finding, ...]:
+    """Low-confidence, log-limited patterns; no outage or periodicity claims."""
+    result = []
+    for item in incident_patterns.recurrent_incidents(rows, now)[:5]:
+        hour = (f' Частые события около {item.recurring_utc_hour:02d}:00 UTC; '
+                'это наблюдаемое совпадение, а не доказанный график сбоев.'
+                if item.recurring_utc_hour is not None else '')
+        result.append(Finding('recurrent_no_icmp', 'notice', 'низкая',
+            f'Повторные пропуски ICMP: {item.ip}',
+            f'В доступной локальной истории отмечено {item.episodes} отдельных эпизодов '
+            f'на {item.distinct_utc_days} днях (UTC). Нет данных о периодах, когда мониторинг не работал. '
+            'Нет доказательства, что узел действительно отключался.' + hour,
+            (Evidence('Локальный журнал мониторинга',
+                      f'{item.first_at.isoformat(timespec="minutes")} — '
+                      f'{item.last_at.isoformat(timespec="minutes")}; '
+                      f'{item.episodes} отдельных записанных эпизодов'),),
+            ('Проверить доступность TCP-сервиса и разрешение ICMP у этого узла.',
+             'Сопоставить события с логами коммутатора и временными окнами обслуживания.')))
+    return tuple(result)
+
+
+def export_report(findings: Sequence[Finding], timeline: Sequence[detective_timeline.IncidentMoment] = (),
+                  health: incident_patterns.AvailabilityIndex | None = None) -> dict:
     """Explicit, bounded whitelist. Contains network IDs; caller must obtain user action."""
     return {
         'product': 'BLOODSKY NET',
-        'engine': 'DETECTIVE rules v2.2',
+        'engine': 'DETECTIVE rules v2.3',
+        'icmp_index': ({'score': health.score, 'responsive': health.responsive,
+                        'unresponsive': health.unresponsive, 'explanation': health.explanation}
+                       if health is not None else None),
         'recommended_checks': list(triage_steps(findings)),
         'timeline': [{'timestamp': m.observed_at.isoformat(timespec='seconds'),
                       'source': m.source, 'observation': m.description} for m in list(timeline)[-60:]],
@@ -316,7 +342,8 @@ def export_report(findings: Sequence[Finding], timeline: Sequence[detective_time
     }
 
 
-def export_html_report(findings: Sequence[Finding], timeline: Sequence[detective_timeline.IncidentMoment] = ()) -> str:
+def export_html_report(findings: Sequence[Finding], timeline: Sequence[detective_timeline.IncidentMoment] = (),
+                       health: incident_patterns.AvailabilityIndex | None = None) -> str:
     """Offline printable HTML report. No remote assets or script execution."""
     esc = lambda value: html.escape(str(value), quote=True)
     incident_rows = ''.join(f'<tr><td>{esc(m.observed_at.isoformat(timespec="seconds"))}</td>'
@@ -325,6 +352,9 @@ def export_html_report(findings: Sequence[Finding], timeline: Sequence[detective
     history_html = ('<h2>Временная шкала наблюдений</h2><table><thead><tr>'
                     '<th>UTC</th><th>Источник</th><th>Наблюдение</th></tr></thead><tbody>'
                     + incident_rows + '</tbody></table>') if incident_rows else ''
+    health_html = ('<section><h2>Индекс ответов ICMP</h2><p>'
+                   + esc('Не рассчитан' if health.score is None else str(health.score) + '/100')
+                   + ' · ' + esc(health.explanation) + '</p></section>') if health is not None else ''
     advice = ''.join(f'<li>{esc(a)}</li>' for a in triage_steps(findings))
     plan_html = '<h2>Порядок проверок инженера</h2><ol>' + advice + '</ol>' if advice else ''
     sections = []
@@ -340,7 +370,7 @@ def export_html_report(findings: Sequence[Finding], timeline: Sequence[detective
             "<style>body{font:15px Arial,sans-serif;max-width:900px;margin:36px auto;color:#203044;}"
             "section{border:1px solid #ced5de;border-radius:8px;padding:14px 18px;margin:18px 0}"
             "h1,h2{color:#174a80}li{margin:6px 0}th,td{padding:7px;text-align:left;border-bottom:1px solid #ccd;}</style></head><body>"
-            "<h1>BLOODSKY NET · DETECTIVE v2.2</h1>"
+            "<h1>BLOODSKY NET · DETECTIVE v2.3</h1>"
             "<p>Локальный отчёт. Выводы вероятностны; ICMP/LLDP и счётчики не доказывают физическую поломку. "
             "Содержит сетевые идентификаторы — передавайте только уполномоченным получателям.</p>"
-            + plan_html + history_html + ''.join(sections) + '</body></html>')
+            + health_html + plan_html + history_html + ''.join(sections) + '</body></html>')
