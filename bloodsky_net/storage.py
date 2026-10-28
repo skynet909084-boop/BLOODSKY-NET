@@ -18,6 +18,10 @@ def storage_root() -> Path:
     return result
 
 
+EVENT_RETENTION_DAYS = 14
+EVENT_MAX_ROWS = 25000
+
+
 class Storage:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else storage_root() / "network.db"
@@ -41,6 +45,7 @@ class Storage:
         self.db.commit()
         self._wifi_writes = 0
         self._port_writes = 0
+        self._event_writes = 0
 
     # Only harmless UI booleans are persisted. Never store SNMP credentials here.
     PREFERENCE_KEYS = frozenset({"monitor_enabled", "alerts_enabled", "windows_alerts_enabled", "minimize_to_tray"})
@@ -77,8 +82,15 @@ class Storage:
         return result
 
     def event(self, severity: str, title: str, detail: str):
+        """Bound 24/7 event history on disk; pruning does not affect live alerts."""
         self.db.execute("INSERT INTO events(ts, severity, title, detail) VALUES (?, ?, ?, ?)",
                         (now_iso(), severity, title, detail))
+        self._event_writes += 1
+        if self._event_writes % 100 == 0:
+            self.db.execute("DELETE FROM events WHERE datetime(ts) < datetime('now', ?)",
+                            (f'-{EVENT_RETENTION_DAYS} days',))
+            self.db.execute("DELETE FROM events WHERE id NOT IN "
+                            "(SELECT id FROM events ORDER BY id DESC LIMIT ?)", (EVENT_MAX_ROWS,))
         self.db.commit()
 
     def events(self, limit: int = 300):
