@@ -41,6 +41,8 @@ from . import topology_incidents
 from . import port_health
 from . import fdb
 from . import traffic
+from . import device_identity
+from . import device_traffic
 from . import notifications
 from . import dhcp
 from . import windows_integration
@@ -77,6 +79,7 @@ class NetApp(tk.Tk):
         self.topology_received: dict[str, float] = {}
         self.topology_failed: set[str] = set()
         self.port_rates: dict[str, dict[int, traffic.PortRate]] = {}
+        self.identity_busy = False
         self.port_error_deltas: dict[str, tuple[port_health.ErrorDelta, ...]] = {}
         self.selected_port: tuple[str, int] | None = None
         self.snmp_auto_enabled = False
@@ -342,19 +345,29 @@ class NetApp(tk.Tk):
         self.traffic_label = self._label(detail, "Трафик адаптера: измерение…", 10, color=MUTED)
         self.traffic_label.pack(anchor="w", padx=15, pady=(0, 13))
         charts = tk.Frame(parent, bg=BG)
-        charts.pack(fill="both", expand=True)
+        charts.pack(fill="x", pady=(0, 10))
         a = self._panel(charts)
         a.pack(side="left", fill="both", expand=True, padx=(0, 9))
         self._label(a, "ЗАДЕРЖКА ДО ШЛЮЗА  ·  ms", 10, True, TEXT).pack(anchor="w", padx=16, pady=(14, 8))
-        self.latency_canvas = tk.Canvas(a, bg=PANEL, highlightthickness=0, height=220)
+        self.latency_canvas = tk.Canvas(a, bg=PANEL, highlightthickness=0, height=128)
         self.latency_canvas.pack(fill="both", expand=True, padx=11, pady=(0, 10))
         self.latency_canvas.bind("<Configure>", lambda e: self._draw_charts())
         b = self._panel(charts)
         b.pack(side="left", fill="both", expand=True, padx=(9, 0))
         self._label(b, "УРОВЕНЬ WI-FI  ·  %", 10, True, TEXT).pack(anchor="w", padx=16, pady=(14, 8))
-        self.signal_canvas = tk.Canvas(b, bg=PANEL, highlightthickness=0, height=220)
+        self.signal_canvas = tk.Canvas(b, bg=PANEL, highlightthickness=0, height=128)
         self.signal_canvas.pack(fill="both", expand=True, padx=11, pady=(0, 10))
         self.signal_canvas.bind("<Configure>", lambda e: self._draw_charts())
+        usage_panel = self._panel(parent)
+        usage_panel.pack(fill='both', expand=True)
+        self._label(usage_panel, 'КТО ИСПОЛЬЗУЕТ ТРАФИК · SNMP', 10, True, TEXT).pack(
+            anchor='w', padx=12, pady=(14, 4))
+        self.usage_canvas = tk.Canvas(usage_panel, bg=PANEL, highlightthickness=0, height=142)
+        self.usage_canvas.pack(fill='both', expand=True, padx=8)
+        self.usage_canvas.bind('<Configure>', lambda _e: self._draw_consumption())
+        self.usage_note = self._label(usage_panel, 'Нужны два SNMP-опроса и FDB коммутатора.',
+                                      8, color=MUTED, wraplength=600, justify='left')
+        self.usage_note.pack(anchor='w', padx=10, pady=(1, 11))
         self._label(parent, "Карта отображает логические связи обнаруженных устройств. Физические порты и кабели без SNMP/LLDP неизвестны.",
                     9, color=MUTED).pack(anchor="w", pady=(12, 0))
 
@@ -366,8 +379,9 @@ class NetApp(tk.Tk):
         self.devices_count.pack(side="left")
         self._button(toolbar, "Экспорт CSV", self.export_csv).pack(side="right", padx=(6, 0))
         self._button(toolbar, "Отчёт JSON", self.export_json).pack(side="right", padx=(6, 0))
+        self._button(toolbar, 'Уточнить модели · UPnP', self._discover_models).pack(side='right', padx=(6, 0))
         frame, self.device_table = self._tree(parent,
-            ("IP-адрес", "Имя устройства", "Тип", "MAC", "Производитель", "Состояние", "Ping, мс"),
+            ("IP-адрес", "Имя устройства", "Модель / тип", "MAC", "Производитель", "Состояние", "Ping, мс"),
             (122, 160, 225, 141, 151, 109, 92))
         frame.pack(fill="both", expand=True)
         self.device_table.tag_configure("up", foreground=GREEN)
@@ -424,6 +438,7 @@ class NetApp(tk.Tk):
         group.pack(side="left", padx=(8, 0))
         group.bind("<<ComboboxSelected>>", lambda _event: self._draw_map())
         self._button(top, "На весь экран  ⛶", self._open_fullscreen_map, primary=True).pack(side="right", padx=(7, 0))
+        self._button(top, 'Уточнить модели', self._discover_models).pack(side='right', padx=(7, 0))
         self._button(top, "Сбросить позиции", self._reset_map_positions).pack(side="right", padx=(7, 0))
         self._button(top, "Сохранить карту SVG", self.export_map).pack(side="right", padx=(8, 0))
         self._button(top, "Опрос SNMP/LLDP", self._snmp_dialog, primary=True).pack(side="right")
