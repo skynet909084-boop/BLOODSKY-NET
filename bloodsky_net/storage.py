@@ -25,6 +25,7 @@ class Storage:
         self.db = sqlite3.connect(self.path)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("CREATE TABLE IF NOT EXISTS devices (ip TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, severity TEXT NOT NULL, title TEXT NOT NULL, detail TEXT NOT NULL)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
         self.db.execute("CREATE TABLE IF NOT EXISTS wifi_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, connected INTEGER NOT NULL, ssid TEXT NOT NULL, bssid TEXT NOT NULL, signal INTEGER NOT NULL, channel INTEGER NOT NULL)")
@@ -40,6 +41,22 @@ class Storage:
         self.db.commit()
         self._wifi_writes = 0
         self._port_writes = 0
+
+    # Only harmless UI booleans are persisted. Never store SNMP credentials here.
+    PREFERENCE_KEYS = frozenset({"monitor_enabled", "alerts_enabled", "windows_alerts_enabled", "minimize_to_tray"})
+
+    def get_preference(self, name: str, default: bool = False) -> bool:
+        if name not in self.PREFERENCE_KEYS:
+            raise ValueError("Unknown preference")
+        row = self.db.execute("SELECT value FROM preferences WHERE key=?", (name,)).fetchone()
+        return bool(row[0]) if row else bool(default)
+
+    def set_preference(self, name: str, value: bool) -> None:
+        if name not in self.PREFERENCE_KEYS or type(value) is not bool:
+            raise ValueError("Only safe boolean preferences may be saved")
+        self.db.execute("INSERT INTO preferences(key,value) VALUES (?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (name, int(value)))
+        self.db.commit()
 
     def save_device(self, device: Device):
         self.db.execute("INSERT INTO devices(ip, payload) VALUES (?, ?) ON CONFLICT(ip) DO UPDATE SET payload=excluded.payload",
