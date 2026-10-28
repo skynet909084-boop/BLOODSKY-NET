@@ -88,6 +88,10 @@ class Storage:
                 FOREIGN KEY(capture_id) REFERENCES lldp_captures(id) ON DELETE CASCADE)""")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_lldp_captures_ip ON lldp_captures(source_ip, id)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_network_snapshots_ts ON network_snapshots(ts)")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS probe_packages (
+            id TEXT PRIMARY KEY, created_at TEXT NOT NULL, label TEXT NOT NULL,
+            json TEXT NOT NULL)""")
+        self.db.execute('CREATE INDEX IF NOT EXISTS idx_probe_packages_created ON probe_packages(created_at)')
         self.db.commit()
         self._wifi_writes = 0
         self._port_writes = 0
@@ -437,6 +441,31 @@ class Storage:
         if before_id == after_id or len(rows) != 2 or rows[0][1] != rows[1][1]:
             raise ValueError('Select two different LLDP captures from the same switch')
         return compare_links(self.lldp_capture_neighbors(before_id), self.lldp_capture_neighbors(after_id))
+
+    def save_probe_package(self, snapshot):
+        """Bounded local data exchange; duplicates ignored, credentials never stored."""
+        from . import distributed_probes as probes
+        payload = probes.encode(snapshot).decode('utf-8')
+        # Always revalidate through the same strict import path.
+        probes.decode(payload.encode('utf-8'))
+        with self.db:
+            self.db.execute('INSERT OR IGNORE INTO probe_packages(id,created_at,label,json) VALUES (?,?,?,?)',
+                            (snapshot.ident, snapshot.created_at.isoformat(), snapshot.label, payload))
+            self.db.execute("DELETE FROM probe_packages WHERE created_at < datetime('now','-7 days')")
+            self.db.execute('DELETE FROM probe_packages WHERE id NOT IN '
+                            '(SELECT id FROM probe_packages ORDER BY created_at DESC, id DESC LIMIT 256)')
+
+    def probe_packages(self, limit: int = 64):
+        from . import distributed_probes as probes
+        rows = self.db.execute('SELECT json FROM probe_packages ORDER BY created_at DESC,id DESC LIMIT ?',
+                               (max(1, min(256, int(limit))),)).fetchall()
+        result = []
+        for (payload,) in rows:
+            try:
+                result.append(probes.decode(payload.encode('utf-8')))
+            except (ValueError, AttributeError):
+                continue
+        return tuple(result)
 
     def close(self):
         self.db.close()
