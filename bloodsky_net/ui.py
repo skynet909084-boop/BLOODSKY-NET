@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 import json
 import sqlite3
+import ssl
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import ipaddress
@@ -21,6 +22,7 @@ from . import network as net
 from . import wifi
 from . import wifi_radar
 from . import distributed_probes as probes
+from . import probe_transport
 from . import wifi_survey
 from . import wifi_survey_compare
 from . import wifi_survey_audit
@@ -86,6 +88,9 @@ class NetApp(tk.Tk):
         self.monitor_thread: threading.Thread | None = None
         self.monitor_restart_at = 0.0
         self.monitor_failures = 0
+        self.probe_receiver = None
+        self.probe_send_busy = False
+        self.probe_last_auto = time.monotonic()
         self.tray: TrayController | None = None
         self.gateway, route_ip = net.default_gateway()
         self.local_route_ip = route_ip
@@ -148,6 +153,7 @@ class NetApp(tk.Tk):
         self.after(1100, self._traffic_tick)
         self.after(1000, self._snmp_tick)
         self.after(2500, self._monitor_guard)
+        self.after(1000, self._probes_network_tick)
         self._read_wifi_background()
         self._setup_tray()
         if self.monitor_enabled.get() and (self.devices or self.gateway):
@@ -1298,11 +1304,11 @@ class NetApp(tk.Tk):
 
     def _page_probes(self):
         parent = self._new_page('Точки наблюдения')
-        self._label(parent, 'DISTRIBUTED PROBES · первая офлайн-версия', 14, True, BLUE).pack(
+        self._label(parent, 'DISTRIBUTED PROBES · TLS-обмен только по разрешению', 14, True, BLUE).pack(
             anchor='w', pady=(0, 5))
-        self._label(parent, 'Снимите ICMP-показания на каждом компьютере с BLOODSKY NET и вручную '
-                    'перенесите JSON-файлы сюда. Сеть не открывается для входящих подключений. '
-                    'Имя источника и данные импортированного файла не подтверждены криптографически.',
+        self._label(parent, 'Ручной JSON-обмен остаётся доступен. Защищённый LAN-обмен включается только вручную: '
+                    'TLS, проверка SHA-256 сертификата и секретный код сеанса. Без обнаружения узлов, '
+                    'фонового приёма при запуске или сохранения ключей. ICMP-данные остаются утверждениями источника.',
                     9, color=MUTED, wraplength=1050, justify='left').pack(anchor='w', pady=(0, 12))
         bar = tk.Frame(parent, bg=BG)
         bar.pack(fill='x', pady=(0, 10))
@@ -1314,6 +1320,51 @@ class NetApp(tk.Tk):
         self._button(bar, 'Сохранить мои измерения', self._probes_export, primary=True).pack(side='left')
         self._button(bar, 'Импорт JSON', self._probes_import).pack(side='left', padx=8)
         self._button(bar, 'Сравнить', self._probes_refresh).pack(side='left')
+        secure = self._panel(parent)
+        secure.pack(fill='x', pady=(0, 10))
+        self._label(secure, 'ЗАЩИЩЁННЫЙ ОБМЕН ПО ЛОКАЛЬНОЙ СЕТИ · ОТКЛЮЧЁН ПРИ ЗАПУСКЕ',
+                    10, True, BLUE).pack(anchor='w', padx=11, pady=(8, 4))
+        recv = tk.Frame(secure, bg=PANEL)
+        recv.pack(fill='x', padx=11, pady=3)
+        self.probe_bind = tk.StringVar(value='127.0.0.1')
+        self.probe_port = tk.StringVar(value='18443')
+        self.probe_cert = tk.StringVar(value='')
+        self.probe_access = tk.StringVar(value='')
+        self._label(recv, 'Принимать на IPv4:', 9, color=MUTED).pack(side='left')
+        tk.Entry(recv, textvariable=self.probe_bind, width=16).pack(side='left', padx=5)
+        self._label(recv, 'Порт:', 9, color=MUTED).pack(side='left')
+        tk.Entry(recv, textvariable=self.probe_port, width=7).pack(side='left', padx=5)
+        self._button(recv, 'Включить приём', self._probes_listen).pack(side='left', padx=6)
+        self._button(recv, 'Отключить', self._probes_stop).pack(side='left')
+        for caption, var in [('SHA-256 сертификата', self.probe_cert),
+                              ('Код доступа сеанса', self.probe_access)]:
+            line = tk.Frame(secure, bg=PANEL)
+            line.pack(fill='x', padx=11, pady=2)
+            self._label(line, caption, 9, color=MUTED).pack(side='left', padx=(0, 5))
+            tk.Entry(line, textvariable=var, width=67, state='readonly').pack(side='left', fill='x', expand=True)
+        peer = tk.Frame(secure, bg=PANEL)
+        peer.pack(fill='x', padx=11, pady=(8, 2))
+        self.probe_peer_host = tk.StringVar(value='127.0.0.1')
+        self.probe_peer_port = tk.StringVar(value='18443')
+        self._label(peer, 'Получатель IPv4:', 9, color=MUTED).pack(side='left')
+        tk.Entry(peer, textvariable=self.probe_peer_host, width=16).pack(side='left', padx=5)
+        self._label(peer, 'Порт:', 9, color=MUTED).pack(side='left')
+        tk.Entry(peer, textvariable=self.probe_peer_port, width=7).pack(side='left', padx=5)
+        self._button(peer, 'Отправить свежие ICMP', self._probes_send).pack(side='left', padx=6)
+        self.probe_auto = tk.BooleanVar(value=False)
+        tk.Checkbutton(peer, variable=self.probe_auto, text='Автоотправка каждые 60 с',
+                       bg=PANEL, fg=TEXT, activebackground=PANEL, selectcolor=PANEL_ALT).pack(side='left')
+        auth = tk.Frame(secure, bg=PANEL)
+        auth.pack(fill='x', padx=11, pady=(2, 9))
+        self.probe_peer_cert = tk.StringVar(value='')
+        self.probe_peer_key = tk.StringVar(value='')
+        self._label(auth, 'SHA-256 получателя:', 9, color=MUTED).pack(side='left')
+        tk.Entry(auth, textvariable=self.probe_peer_cert, width=45).pack(side='left', padx=5)
+        self._label(auth, 'Код:', 9, color=MUTED).pack(side='left')
+        tk.Entry(auth, textvariable=self.probe_peer_key, width=21, show='•').pack(side='left', padx=5)
+        self._label(secure, 'Отпечаток и код передавайте через доверенный канал. В брандмауэре Windows '
+                    'может понадобиться вручную разрешить выбранный порт. Ни один порт не открывается автоматически.',
+                    9, color=MUTED, wraplength=1030, justify='left').pack(anchor='w', padx=11, pady=(0, 7))
         self.probes_note = self._label(parent,
             'Нужны свежие наблюдения текущего мониторинга; сохранённый инвентарь не используется.',
             9, color=MUTED, wraplength=1020, justify='left')
@@ -1333,6 +1384,88 @@ class NetApp(tk.Tk):
                     'Сравниваются только измерения в интервале до 5 минут. '
                     'Пропущенные/устаревшие результаты исключаются.',
                     9, color=MUTED, wraplength=1000, justify='left').pack(anchor='w', pady=(9, 0))
+
+    def _probes_fresh_snapshot(self):
+        now = time.monotonic()
+        stamp = datetime.now(timezone.utc)
+        with self.state_lock:
+            rows = [(ip, 'reply' if state == 'up' else 'no_icmp',
+                     stamp - timedelta(seconds=max(0, now-self._timeline_seen_at.get(ip, 0))))
+                    for ip, state in self._timeline_status.items()
+                    if state in ('up', 'down') and 0 <= now-self._timeline_seen_at.get(ip, 0) <= 180]
+        return probes.create_snapshot(self.probe_label.get(), rows[:probes.MAX_ITEMS], stamp)
+
+    def _probes_listen(self):
+        try:
+            if self.probe_receiver:
+                raise ValueError('Приём уже включён')
+            ip = probe_transport.allowed_ip(self.probe_bind.get())
+            port = probe_transport.allowed_port(int(self.probe_port.get()))
+            if not ip.startswith('127.') and not messagebox.askyesno(
+                'Разрешить входящие подключения?',
+                f'Разрешить приём ICMP-измерений по TLS на {ip}:{port}? '
+                'Только от компьютера с секретным кодом; отправитель должен проверить отпечаток. '
+                'Windows Firewall настраивается отдельно.',parent=self):
+                return
+            server = probe_transport.PeerReceiver(ip, port).start()
+            self.probe_receiver = server
+            self.probe_cert.set(server.fingerprint)
+            self.probe_access.set(server.token)
+            self._set_status('Защищённый приём включён только на указанном IPv4. Код действует до отключения.')
+        except (ValueError, OSError, RuntimeError) as exc:
+            messagebox.showerror('Точки наблюдения', str(exc), parent=self)
+
+    def _probes_stop(self):
+        if self.probe_receiver:
+            self.probe_receiver.stop()
+            self.probe_receiver = None
+        self.probe_cert.set('')
+        self.probe_access.set('')
+        self._set_status('Входящие подключения отключены. Старый код доступа недействителен.')
+
+    def _probes_send(self):
+        if self.probe_send_busy:
+            return
+        try:
+            snapshot = self._probes_fresh_snapshot()
+            host = probe_transport.allowed_ip(self.probe_peer_host.get())
+            port = probe_transport.allowed_port(int(self.probe_peer_port.get()))
+            cert = probe_transport.validate_fingerprint(self.probe_peer_cert.get())
+            code = probe_transport.validate_token(self.probe_peer_key.get())
+        except (ValueError, OSError) as exc:
+            self.probe_auto.set(False)
+            messagebox.showwarning('Точки наблюдения', str(exc), parent=self)
+            return
+        self.probe_send_busy = True
+        self.probe_last_auto = time.monotonic()
+        def worker():
+            try:
+                probe_transport.send_snapshot(host, port, cert, code, snapshot)
+                self.messages.put(('probe_send_result', True, 'TLS-пакет принят удалённой точкой.'))
+            except (ValueError, OSError, ssl.SSLError) as exc:
+                self.messages.put(('probe_send_result', False, 'Обмен не удался: '+str(exc)[:180]))
+        threading.Thread(target=worker, daemon=True, name='BloodskyProbeSend').start()
+
+    def _probes_network_tick(self):
+        if self._closed:
+            return
+        server = self.probe_receiver
+        if server:
+            imported = False
+            for _ in range(16):
+                try: snapshot = server.incoming.get_nowait()
+                except queue.Empty: break
+                try:
+                    self.store.save_probe_package(snapshot)
+                    imported = True
+                except (ValueError, sqlite3.Error):
+                    self._set_status('Удалённый пакет отклонён SQLite')
+            if imported:
+                self._probes_refresh()
+                self._set_status('Аутентифицированный TLS-пакет получен. Содержимое ICMP не проверено независимо.')
+        if self.probe_auto.get() and not self.probe_send_busy and time.monotonic()-self.probe_last_auto >= 60:
+            self._probes_send()
+        self.after(1000, self._probes_network_tick)
 
     def _probes_export(self):
         now_monotonic = time.monotonic()
@@ -1701,6 +1834,9 @@ class NetApp(tk.Tk):
                 elif kind == "monitor_stopped":
                     if item[1] is self.monitor_stop and not item[1].is_set() and self.monitor_enabled.get():
                         self.monitoring = False
+                elif kind == 'probe_send_result':
+                    self.probe_send_busy = False
+                    self._set_status(item[2])
                 elif kind == "tray_show":
                     self.show_window()
                 elif kind == "tray_exit":
@@ -2529,6 +2665,10 @@ class NetApp(tk.Tk):
         if self._closed:
             return
         self._closed = True
+        if self.probe_receiver:
+            self.probe_receiver.stop()
+            self.probe_receiver = None
+        self.probe_auto.set(False)
         self.scan_stop.set()
         self.monitor_stop.set()
         if self.tray is not None:
