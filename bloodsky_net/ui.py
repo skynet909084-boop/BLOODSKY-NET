@@ -17,6 +17,8 @@ from . import network as net
 from . import wifi
 from . import topology
 from . import fdb
+from . import traffic
+from . import notifications
 from .storage import Storage
 
 BG = "#0B1220"
@@ -48,6 +50,7 @@ class NetApp(tk.Tk):
         self.snmp_due: dict[str, float] = {}
         self.topology_received: dict[str, float] = {}
         self.topology_failed: set[str] = set()
+        self.port_rates: dict[str, dict[int, traffic.PortRate]] = {}
         self.snmp_auto_enabled = False
         self.snmp_interval = 60
         self.state_lock = threading.Lock()
@@ -74,6 +77,7 @@ class NetApp(tk.Tk):
         self.ip_alerts: dict[str, net.MacChange] = {}
         self.ip_alert_expiry: dict[str, float] = {}
         self.alerts_enabled = tk.BooleanVar(value=True)
+        self.windows_alerts_enabled = tk.BooleanVar(value=False)  # explicit opt-in
         self.alert_last: dict[tuple[str, str, str], float] = {}
         self.alert_token = 0
         self.wifi_last_saved = float('-inf')
@@ -149,7 +153,7 @@ class NetApp(tk.Tk):
         self._label(brand, "N E T W O R K  M O N I T O R", 8, color=MUTED).pack(anchor="w", pady=(2, 0))
         self._label(sidebar, "РАЗДЕЛЫ", 9, True, MUTED).pack(anchor="w", padx=22, pady=(35, 12))
         navigation = [("◫", "Обзор"), ("▤", "Устройства"), ("◇", "Карта сети"),
-                      ("◉", "Wi-Fi"), ("⌁", "Диагностика"), ("▣", "События")]
+                      ("◉", "Wi-Fi"), ("⇅", "Порты"), ("⌁", "Диагностика"), ("▣", "События")]
         for glyph, name in navigation:
             btn = tk.Button(sidebar, text=f"  {glyph}   {name}", relief="flat", borderwidth=0,
                             anchor="w", padx=19, pady=13, font=("Segoe UI", 11),
@@ -202,6 +206,7 @@ class NetApp(tk.Tk):
         self._page_devices()
         self._page_map()
         self._page_wifi()
+        self._page_ports()
         self._page_tools()
         self._page_events()
         self.alert_banner = self._label(right, "", 10, True, YELLOW)
@@ -222,6 +227,7 @@ class NetApp(tk.Tk):
         self.current_page = page
         self.title_label.configure(text={"Обзор": "Обзор сети", "Устройства": "Обнаруженные устройства",
                                          "Карта сети": "Карта локальной сети", "Wi-Fi": "Мониторинг Wi-Fi",
+                                         "Порты": "Трафик портов коммутаторов",
                                          "Диагностика": "Инструменты диагностики", "События": "Журнал событий"}[page])
         for name, btn in self.nav_buttons.items():
             btn.configure(bg=PANEL_ALT if name == page else SIDEBAR,
@@ -325,6 +331,21 @@ class NetApp(tk.Tk):
         self.fdb_table.configure(height=4)
         fdb_frame.pack(fill="x")
 
+    def _page_ports(self):
+        parent = self._new_page("Порты")
+        self.port_note = self._label(parent,
+            "SNMP IF-MIB: выберите управляемый коммутатор на вкладке «Карта сети» и включите автоопрос. "
+            "Для скорости нужны два снимка 64-битных счётчиков.", 10, color=MUTED,
+            wraplength=950, justify='left')
+        self.port_note.pack(anchor='w', pady=(0, 15))
+        frame, self.port_table = self._tree(parent,
+            ("SNMP IP", "Интерфейс", "Состояние", "Вход Мбит/с", "Выход Мбит/с", "Скорость порта"),
+            (140, 245, 115, 145, 145, 155))
+        frame.pack(fill='both', expand=True)
+        self._label(parent, "Это скорость трафика по SNMP IF-MIB, а не доказательство прямого физического соединения. "
+                    "«—» означает отсутствие достоверного измерения; оно не равно нулю.",
+                    9, color=MUTED, wraplength=950, justify='left').pack(anchor='w', pady=12)
+
     def _page_wifi(self):
         parent = self._new_page("Wi-Fi")
         bar = tk.Frame(parent, bg=BG)
@@ -387,6 +408,10 @@ class NetApp(tk.Tk):
         tk.Checkbutton(parent, text="Показывать предупреждения внутри окна", variable=self.alerts_enabled,
                        bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
                        activeforeground=TEXT, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 8))
+        tk.Checkbutton(parent, text="Уведомления Windows (по умолчанию выключены)",
+                       variable=self.windows_alerts_enabled, bg=BG, fg=TEXT,
+                       selectcolor=PANEL, activebackground=BG, activeforeground=TEXT,
+                       font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 8))
         frame, self.events_table = self._tree(parent,
             ("Дата/время", "Уровень", "Событие", "Подробности"),
             (195, 125, 225, 630))
@@ -507,8 +532,15 @@ class NetApp(tk.Tk):
                 elif kind == "topology":
                     self.snmp_busy = False
                     snapshot = item[1]
+                    last = self.topology_snapshots.get(snapshot.source_ip)
+                    last_at = self.topology_received.get(snapshot.source_ip)
+                    received_at = time.monotonic()
+                    self.port_rates[snapshot.source_ip] = (
+                        traffic.calculate_port_rates(last.port_counters, snapshot.port_counters,
+                                                     received_at - last_at)
+                        if last is not None and last_at is not None else {})
                     self.topology_snapshots[snapshot.source_ip] = snapshot
-                    self.topology_received[snapshot.source_ip] = time.monotonic()
+                    self.topology_received[snapshot.source_ip] = received_at
                     self.topology_failed.discard(snapshot.source_ip)
                     self.snmp_due[snapshot.source_ip] = time.monotonic() + self.snmp_interval
                     self._event("info", "SNMP опрос", f"{snapshot.source_ip}: LLDP {len(snapshot.neighbors)}, FDB {len(snapshot.fdb_entries)}")
@@ -517,6 +549,7 @@ class NetApp(tk.Tk):
                 elif kind == "topology_error":
                     self.snmp_busy = False
                     self.topology_failed.add(item[1])
+                    self.port_rates.pop(item[1], None)
                     self.snmp_due[item[1]] = time.monotonic() + self.snmp_interval
                     self._set_status(f"SNMP {item[1]}: ошибка чтения, снимок помечен устаревшим")
                     self._event("warning", "SNMP/LLDP", f"{item[1]}: опрос не удался (проверьте SNMP/ACL)")
@@ -554,7 +587,7 @@ class NetApp(tk.Tk):
                 self.snmp_due[ip] = time.monotonic() + self.snmp_interval
                 threading.Thread(target=self._snmp_worker,
                                  args=(ip, self.snmp_profiles[ip]), daemon=True).start()
-        if self.current_page == 'Карта сети' and self.topology_snapshots:
+        if self.current_page in ('Карта сети', 'Порты') and self.topology_snapshots:
             self._dirty = True  # TTL and stale labels continue updating without new packets.
         self.after(1000, self._snmp_tick)
 
@@ -661,7 +694,9 @@ class NetApp(tk.Tk):
 
     def _event(self, severity, title, detail):
         self.store.event(severity, title, detail)
-        if severity not in ("warning", "error") or not self.alerts_enabled.get() or self._closed:
+        if severity not in ("warning", "error") or self._closed:
+            return
+        if not self.alerts_enabled.get() and not self.windows_alerts_enabled.get():
             return
         now = time.monotonic()
         key = (severity, title, detail)
@@ -670,11 +705,14 @@ class NetApp(tk.Tk):
         self.alert_last[key] = now
         if len(self.alert_last) > 300:
             self.alert_last = {k: t for k, t in self.alert_last.items() if now - t < 300}
-        self.alert_token += 1
-        token = self.alert_token
-        self.alert_banner.configure(text=f"{'СБОЙ' if severity == 'error' else 'ВНИМАНИЕ'} · {title}: {detail[:110]}",
-                                    fg=RED if severity == 'error' else YELLOW)
-        self.after(12000, lambda: self.alert_banner.configure(text="") if token == self.alert_token and not self._closed else None)
+        if self.windows_alerts_enabled.get():
+            notifications.alert_async(title, detail)
+        if self.alerts_enabled.get():
+            self.alert_token += 1
+            token = self.alert_token
+            self.alert_banner.configure(text=f"{'СБОЙ' if severity == 'error' else 'ВНИМАНИЕ'} · {title}: {detail[:110]}",
+                                        fg=RED if severity == 'error' else YELLOW)
+            self.after(12000, lambda: self.alert_banner.configure(text="") if token == self.alert_token and not self._closed else None)
 
     def _refresh_ui(self):
         if not hasattr(self, "metrics"):
@@ -698,6 +736,8 @@ class NetApp(tk.Tk):
             self._paint_fdb(all_devices)
         elif self.current_page == "Wi-Fi":
             self._paint_wifi()
+        elif self.current_page == "Порты":
+            self._paint_ports()
         elif self.current_page == "События":
             self._paint_events()
         elif self.current_page == "Обзор":
@@ -869,6 +909,30 @@ class NetApp(tk.Tk):
         stale = len(self.topology_snapshots) - len(fresh)
         self.topology_note.configure(text=f"LLDP: {total} актуальных, {matched} сопоставлено, {stale} устаревших устройств. "
                                           "Синий — LLDP; пунктир — логическая схема, не кабель.")
+
+    def _paint_ports(self):
+        self.port_table.delete(*self.port_table.get_children())
+        fresh = self._fresh_topology()
+        count = 0
+        for ip, snapshot in sorted(fresh.items()):
+            rates = self.port_rates.get(ip, {})
+            for idx, counter in sorted(snapshot.port_counters.items()):
+                if count >= 500:
+                    break
+                rate = rates.get(idx)
+                def fmt(value):
+                    return f'{value:.3f}' if value is not None else '—'
+                self.port_table.insert('', 'end', values=(
+                    ip, counter.name,
+                    'Up' if counter.oper_up is True else 'Down' if counter.oper_up is False else 'неизвестно',
+                    fmt(rate.inbound_mbps) if rate else '—',
+                    fmt(rate.outbound_mbps) if rate else '—',
+                    f'{counter.speed_mbps} Мбит/с' if counter.speed_mbps else '—'))
+                count += 1
+        self.port_note.configure(text=(
+            f'Получено {count} портов из {len(fresh)} свежих SNMP-снимков. '
+            'Скорость рассчитывается по разнице последовательных 64-битных счётчиков; '
+            'неизвестные значения не подменяются нулём.'))
 
     def _paint_fdb(self, devices):
         self.fdb_table.delete(*self.fdb_table.get_children())
