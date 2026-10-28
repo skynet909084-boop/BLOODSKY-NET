@@ -38,6 +38,9 @@ class ReleaseChecks(unittest.TestCase):
         yml = (self.root / '.github/workflows/windows-build.yml').read_text('utf-8')
         self.assertIn('windows_install_smoke.ps1', yml)
         self.assertIn('BLOODSKY-NET-SHA256', yml)
+        smoke = (self.root / 'tools/windows_install_smoke.ps1').read_text('utf-8')
+        self.assertIn('Get-ChildItem', smoke)
+        self.assertNotIn('BLOODSKY-NET-Setup-0.9.0-rc1.exe', smoke)
         self.assertIn('Build per-user Windows installer', yml)
         self.assertIn('Upload executable', yml)
         self.assertIn('python tools/soak_test.py', yml)
@@ -53,7 +56,7 @@ class ReleaseChecks(unittest.TestCase):
     def test_install_version_matches_application(self):
         from bloodsky_net import __version__
         cfg = (self.root / 'installer/BLOODSKY-NET.iss').read_text('utf-8-sig')
-        self.assertEqual(__version__, '0.9.0-rc1')
+        self.assertTrue(__version__)  # exact identity is checked against installed manifest below
         self.assertIn(f'#define MyAppVersion "{__version__}"', cfg)
         self.assertIn(f'BLOODSKY-NET-Setup-{__version__}', cfg)
 
