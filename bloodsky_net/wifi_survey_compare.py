@@ -124,3 +124,18 @@ def comparison_html(comparison: dict, baseline: Sequence[SurveyPoint],
       '<p>Точки: красный &lt;45%, жёлтый 45–69%, зелёный ≥70%. Пустые места не измерены.</p>'
       '<table><tr>'+''.join('<th>'+esc(k)+'</th>' for k in columns)+'</tr>'+trs+'</table><p>'+
       esc(comparison['limitations'])+'</p></section>')
+
+
+def compose_visit_html(base_html: str, comparison: dict,
+                       baseline: Sequence[SurveyPoint], followup: Sequence[SurveyPoint],
+                       floorplan=None) -> str:
+    """Permit *only* embedded data images in the existing locked-down CSP.
+
+    Never relax script/connect/style origins or accept links to external images.
+    """
+    marker='default-src &apos;none&apos;; style-src'
+    if not isinstance(base_html, str) or marker not in base_html or '</body>' not in base_html:
+        raise ValueError('Отчёт HTML не соответствует ожидаемому безопасному шаблону')
+    return (base_html.replace(marker, 'default-src &apos;none&apos;; img-src data:; style-src', 1)
+                     .replace('</body>', comparison_html(comparison, baseline, followup, floorplan)
+                               + '</body>', 1))
