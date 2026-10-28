@@ -46,7 +46,7 @@ class WiFiPollingTests(unittest.TestCase):
     def test_slow_wifi_read_does_not_spawn_concurrent_workers(self):
         entered, release = threading.Event(), threading.Event()
         output = Queue()
-        app = SimpleNamespace(_closed=False, _wifi_busy=threading.Event(), messages=output)
+        app = SimpleNamespace(_closed=False, _wifi_busy=threading.Event(), _wifi_lock=threading.Lock(), messages=output)
         calls = []
         def slow_wifi():
             calls.append(1)
@@ -66,8 +66,32 @@ class WiFiPollingTests(unittest.TestCase):
             self.assertFalse(app._wifi_busy.is_set())
             self.assertEqual(output.get_nowait(), ('wifi', 'report'))
 
+    def test_concurrent_wifi_requests_share_one_worker(self):
+        entered, release = threading.Event(), threading.Event()
+        app = SimpleNamespace(_closed=False, _wifi_busy=threading.Event(),
+                              _wifi_lock=threading.Lock(), messages=Queue())
+        count = []
+        def slow_read():
+            count.append(1)
+            entered.set()
+            release.wait(3)
+            return 'ok'
+        with patch('bloodsky_net.ui.wifi.read_wifi', side_effect=slow_read):
+            callers = [threading.Thread(target=NetApp._read_wifi_background, args=(app,)) for _ in range(25)]
+            for caller in callers:
+                caller.start()
+            self.assertTrue(entered.wait(3))
+            for caller in callers:
+                caller.join(3)
+            self.assertEqual(len(count), 1)
+            release.set()
+            deadline = time.monotonic() + 3
+            while app._wifi_busy.is_set() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertFalse(app._wifi_busy.is_set())
+
     def test_failed_wifi_query_does_not_leave_stuck_worker(self):
-        app = SimpleNamespace(_closed=False, _wifi_busy=threading.Event(), messages=Queue())
+        app = SimpleNamespace(_closed=False, _wifi_busy=threading.Event(), _wifi_lock=threading.Lock(), messages=Queue())
         with patch('bloodsky_net.ui.wifi.read_wifi', side_effect=OSError('private diagnostic text')):
             NetApp._read_wifi_background(app)
             deadline = time.monotonic() + 3
